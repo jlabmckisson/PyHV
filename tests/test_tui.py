@@ -66,6 +66,24 @@ class PanelTest(unittest.IsolatedAsyncioTestCase):
                 return
         self.fail("timed out waiting for the panel")
 
+    async def connected(self, pilot):
+        """Bring the panel up on the simulator, with a reading in hand.
+
+        Waiting for `_rows_built` alone is not enough: it means the table has
+        its columns, which `on_device_ready` builds from the parameter list
+        before any channel has been read.  `flags` and `values` stay empty
+        until the first poll lands, and a test that acts in that window acts on
+        a panel that does not yet know what the channels are doing -- no live
+        channels to warn about, no setpoint to step from.  Both callbacks
+        arrive in the same pause on a fast machine, which is why this only
+        ever failed on CI.
+        """
+        await pilot.pause()
+        await pilot.press("down", "down", "enter")         # the simulator
+        await self.settle(pilot, lambda: self.app._rows_built
+                          and all(self.app.values))
+        return self.app.worker
+
 
 class ModulePicker(PanelTest):
 
@@ -359,19 +377,33 @@ class EditingProfiles(PanelTest):
 
 class SwitchingModules(PanelTest):
 
-    async def connected(self, pilot):
-        """Bring the panel up on the simulator."""
-        await pilot.pause()
-        await pilot.press("down", "down", "enter")
-        await self.settle(pilot, lambda: self.app._rows_built)
-        return self.app.worker
-
     async def test_switching_warns_while_channels_are_live(self):
         async with self.app.run_test() as pilot:
             await self.connected(pilot)
             await pilot.press("m")
             await pilot.pause()
             self.assertIn("Disconnect with channels live", self.screen_text())
+            self.app.exit()
+
+    async def test_switching_warns_before_the_first_reading(self):
+        """Nothing read is not nothing energised, and is not treated as it.
+
+        The panel looks the same in both cases -- empty flags -- for as long as
+        it takes the first poll to come back, which on a module answering at
+        9600 baud is not instant.
+        """
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.app.worker.paused = True            # no poll to refill them
+            await pilot.pause(0.3)                   # let one in flight land
+            nch = self.app.nch
+            self.app.flags = [[] for _ in range(nch)]     # what on_device_ready
+            self.app.values = [{} for _ in range(nch)]    # leaves behind
+            await pilot.press("m")
+            await pilot.pause()
+            body = self.screen_text()
+            self.assertIn("Disconnect before the first reading", body)
+            self.assertIn("not known here", body)
             self.app.exit()
 
     async def test_cancelling_the_picker_keeps_the_link(self):
@@ -430,11 +462,9 @@ class SelectingChannels(PanelTest):
     """Marking several channels so one edit reaches all of them."""
 
     async def connected(self, pilot):
-        await pilot.pause()
-        await pilot.press("down", "down", "enter")
-        await self.settle(pilot, lambda: self.app._rows_built)
+        worker = await super().connected(pilot)
         self.app.query_one("#chans", DataTable).focus()
-        return self.app.worker
+        return worker
 
     def ch_column(self) -> list[str]:
         table = self.app.query_one("#chans", DataTable)
@@ -546,10 +576,9 @@ class TheLog(PanelTest):
     """
 
     async def connected(self, pilot):
-        await pilot.pause()
-        await pilot.press("down", "down", "enter")     # the simulator
-        await self.settle(pilot, lambda: self.app._rows_built)
+        worker = await super().connected(pilot)
         self.app.query_one("#chans", DataTable).focus()
+        return worker
 
     async def test_selection_changes_are_recorded(self):
         async with self.app.run_test() as pilot:
@@ -619,10 +648,9 @@ class AdjustingChannels(PanelTest):
     """
 
     async def connected(self, pilot):
-        await pilot.pause()
-        await pilot.press("down", "down", "enter")
-        await self.settle(pilot, lambda: self.app._rows_built)
+        worker = await super().connected(pilot)
         self.app.query_one("#chans", DataTable).focus()
+        return worker
 
     def preview(self) -> str:
         return self.app.screen.query_one("#plan", Static).render().plain
@@ -740,11 +768,6 @@ class AdjustingChannels(PanelTest):
 
 class TableWidth(PanelTest):
     """The status column takes whatever the terminal has spare."""
-
-    async def connected(self, pilot):
-        await pilot.pause()
-        await pilot.press("down", "down", "enter")
-        await self.settle(pilot, lambda: self.app._rows_built)
 
     def widths(self) -> tuple[int, int, int]:
         """(status width, width used by every other column, table width)."""

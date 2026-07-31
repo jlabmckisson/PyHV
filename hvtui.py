@@ -1089,11 +1089,21 @@ class HVApp(App):
     @work
     async def action_switch_module(self) -> None:
         live = [c for c in range(self.nch) if "ON" in self.flags[c]]
-        if live:
+        # An empty `flags` is how the panel looks both when every channel is
+        # off and when nothing has been read yet -- `on_device_ready` clears it
+        # and the first poll fills it.  Silence from a module that may well
+        # have its outputs up is not the same answer as "nothing is on", so
+        # the unknown asks too, and says which of the two it is asking about.
+        known = any(self.values)
+        if live or not known:
             ok = await self.push_screen_wait(ConfirmScreen(
-                "Disconnect with channels live?",
+                "Disconnect with channels live?" if live else
+                "Disconnect before the first reading?",
                 f"Channels {', '.join(map(str, live))} stay energised — the "
-                "module keeps its output when nothing is watching it.",
+                "module keeps its output when nothing is watching it." if live
+                else "No channel has been read yet, so whether any output is "
+                     "energised is not known here — and the module keeps its "
+                     "output when nothing is watching it.",
                 danger=True, default_yes=False))
             if not ok:
                 return
