@@ -1,0 +1,181 @@
+name: build
+
+# Standalone hvctl binaries.  A lab machine in front of a live supply should
+# not need a Python install or a virtualenv to run the panel.
+#
+# Every push and PR builds and smoke-tests all four binaries; pushing a tag
+# (v1.2.3) additionally publishes them to a GitHub release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Not ubuntu-latest: PyInstaller links the build machine's glibc, so
+          # the oldest runner available sets how old a lab box may be.
+          - {os: ubuntu-22.04,  name: linux-x86_64,  binary: hvctl}
+          - {os: macos-14,      name: macos-arm64,   binary: hvctl}
+          - {os: macos-13,      name: macos-x86_64,  binary: hvctl}
+          - {os: windows-2022,  name: windows-x86_64, binary: hvctl.exe}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      # Runs before packaging, against the source tree.  IsolatedAsyncioTestCase
+      # drives the panel through Textual's Pilot, so this covers the TUI as well.
+      - name: Test
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Build
+        # --collect-all textual: the panel's widgets ship .tcss stylesheets and
+        # are pulled in dynamically, neither of which the import graph sees.
+        # hvtui is imported inside cmd_tui() behind a try/except ImportError,
+        # so name it explicitly rather than trust the bytecode scan.
+        run: >
+          pyinstaller --onefile --clean --noconfirm
+          --name hvctl
+          --collect-all textual
+          --hidden-import hvtui
+          --hidden-import hvprofiles
+          --hidden-import serial
+          hv.py
+
+      # Proves the binary starts and that the simulator, the protocol layer and
+      # the profile store all came along.  Every command here is read-only
+      # against the built-in simulator, so it talks to nothing.
+      - name: Smoke test
+        shell: python
+        run: |
+          import subprocess, sys
+          exe = "dist/${{ matrix.binary }}"
+          for argv in (["--sim", "info"], ["--sim", "status"], ["profiles"],
+                       ["--sim", "get", "0", "VMon"],
+                       ["--sim", "raw", "$CMD:MON,PAR:BDNCH"]):
+              r = subprocess.run([exe] + argv, capture_output=True, text=True)
+              print(f"$ hvctl {' '.join(argv)}\n{r.stdout}{r.stderr}")
+              if r.returncode != 0:
+                  sys.exit(f"exit {r.returncode}")
+
+      # Nothing above loads the panel, and a textual left out of the bundle
+      # would only surface the first time an operator pressed a key in front of
+      # a supply.  Open the panel and let it draw.  It never exits on its own --
+      # there is no terminal to quit from -- so the timeout is the pass, and
+      # cmd_tui's own "the TUI needs textual" line is the failure.
+      - name: Verify the panel was bundled
+        shell: python
+        run: |
+          import os, signal, subprocess, sys
+
+          exe = os.path.join("dist", "${{ matrix.binary }}")
+          # Redirect to a file, not a pipe: a --onefile binary is a bootloader
+          # that re-execs the real program as a child, so killing what Popen
+          # returns leaves the child holding the pipe and communicate() blocks
+          # for good.  A file is readable no matter who is still attached to it.
+          with open("panel.log", "w+", errors="replace") as log:
+              kw = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                    if os.name == "nt" else {"start_new_session": True})
+              p = subprocess.Popen([exe, "--sim", "tui"],
+                                   stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=log, **kw)
+              alive = False
+              try:
+                  p.wait(timeout=45)
+              except subprocess.TimeoutExpired:
+                  alive = True  # still up after 45s is the outcome we want
+              if os.name == "nt":
+                  subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                                 capture_output=True)
+              else:
+                  try:          # the whole group: bootloader and its child
+                      os.killpg(p.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+              log.seek(0)
+              blob = log.read()
+
+          if "needs textual" in blob:
+              sys.exit("the panel's dependencies are missing from the bundle:\n"
+                       + blob)
+          if alive:
+              # It sat there running a poll loop against the simulator, which is
+              # all the panel can do with nowhere to draw and no keys coming in.
+              print("panel started and stayed up")
+          else:
+              # A panel that quit on its own said something on the way out --
+              # the log is what killing it would otherwise have cost us.
+              print(f"panel exited with {p.returncode}; log follows:\n{blob[-4000:]}")
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p out
+          cp dist/${{ matrix.binary }} out/
+          cd out
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a ../hvctl-${{ matrix.name }}.zip .
+          else
+            tar czf ../hvctl-${{ matrix.name }}.tar.gz .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hvctl-${{ matrix.name }}
+          path: |
+            hvctl-${{ matrix.name }}.tar.gz
+            hvctl-${{ matrix.name }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifacts
+          # Named, not *: the sums file must not end up hashing itself.
+          sha256sum hvctl-* > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "hvctl ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            hvctl-* SHA256SUMS
