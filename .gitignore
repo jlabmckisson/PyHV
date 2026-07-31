@@ -1,0 +1,39 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging / distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Coverage / test artifacts
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local overrides -- .claude/settings.json is shared, this one is not
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Profiles, if one is ever kept beside the code rather than in ~/.config/hvctl
+profiles.json
+*.bad

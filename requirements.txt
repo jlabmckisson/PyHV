@@ -1,0 +1,3 @@
+# hv.py's read-only subcommands need nothing but the standard library.
+textual >= 1.0      # hv.py tui
+pyserial >= 3.5     # hv.py --serial /dev/ttyACM0
