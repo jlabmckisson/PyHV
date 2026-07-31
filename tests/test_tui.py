@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hvprofiles import Profile, ProfileStore                   # noqa: E402
 from hvtui import ConnectScreen, HVApp, ProfileEditScreen      # noqa: E402
-from textual.widgets import DataTable, Input, Label            # noqa: E402
+from textual.widgets import (DataTable, Input, Label,          # noqa: E402
+                             RichLog, Static)
 
 # A button ignores clicks while its press-flash is showing, so a test that
 # clicks the same button repeatedly has to let the flash expire.
@@ -53,6 +54,10 @@ class PanelTest(unittest.IsolatedAsyncioTestCase):
 
     def error_text(self) -> str:
         return self.app.screen.query_one("#dlg-error", Label).render().plain
+
+    def log_text(self) -> str:
+        return "\n".join(strip.text for strip
+                         in self.app.query_one("#log", RichLog).lines)
 
     async def settle(self, pilot, done, tries: int = 40):
         for _ in range(tries):
@@ -418,6 +423,368 @@ class SwitchingModules(PanelTest):
             self.assertEqual(self.app.nch, 8)
             self.assertEqual(
                 self.app.query_one("#chans", DataTable).row_count, 8)
+            self.app.exit()
+
+
+class SelectingChannels(PanelTest):
+    """Marking several channels so one edit reaches all of them."""
+
+    async def connected(self, pilot):
+        await pilot.pause()
+        await pilot.press("down", "down", "enter")
+        await self.settle(pilot, lambda: self.app._rows_built)
+        self.app.query_one("#chans", DataTable).focus()
+        return self.app.worker
+
+    def ch_column(self) -> list[str]:
+        table = self.app.query_one("#chans", DataTable)
+        return [table.get_cell(f"ch{c}", "CH").plain
+                for c in range(self.app.nch)]
+
+    async def test_s_marks_the_channel_under_the_cursor(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("s", "down", "down", "s")
+            await pilot.pause()
+            self.assertEqual(self.app.selected, {0, 2})
+            self.assertEqual(self.ch_column()[:3], ["*0", "1", "*2"])
+            await pilot.press("s")                   # same channel again
+            await pilot.pause()
+            self.assertEqual(self.app.selected, {0})
+            self.app.exit()
+
+    async def test_a_and_u_select_and_unselect_every_channel(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("a")
+            await pilot.pause()
+            self.assertEqual(self.app.selected, set(range(self.app.nch)))
+            self.assertIn("sel 0-7", self.screen_text())
+            await pilot.press("u")
+            await pilot.pause()
+            self.assertEqual(self.app.selected, set())
+            self.assertNotIn("sel 0-7", self.screen_text())
+            self.assertEqual(self.ch_column()[:2], ["0", "1"])
+            self.app.exit()
+
+    async def test_escape_also_unselects(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("a", "escape")
+            await pilot.pause()
+            self.assertEqual(self.app.selected, set())
+            self.app.exit()
+
+    async def test_the_dialog_names_every_target(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("s", "down", "s", "down", "s")
+            await pilot.press("right", "enter")      # VSet on channel 2
+            await pilot.pause()
+            body = self.screen_text()
+            self.assertIn("CH 0-2", body)
+            self.assertIn("(3 channels)", body)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.app.exit()
+
+    async def test_one_edit_writes_to_every_selected_channel(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("s", "down", "down", "s")   # channels 0 and 2
+            await pilot.press("right", "enter")           # VSet
+            await pilot.pause()
+            self.app.screen.query_one("#value", Input).value = "123.4"
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: all(
+                self.app.values[c].get("VSET", "").startswith("123.4")
+                for c in (0, 2)))
+            self.assertNotEqual(self.app.values[1].get("VSET"), "123.4")
+            self.app.exit()
+
+    async def test_without_a_selection_only_the_cursor_channel_is_written(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "right", "enter")   # CH1 VSet
+            await pilot.pause()
+            self.assertIn("CH 1", self.screen_text())
+            self.assertNotIn("channels)", self.screen_text())
+            self.app.screen.query_one("#value", Input).value = "77.5"
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: self.app.values[1]
+                              .get("VSET", "").startswith("77.5"))
+            self.assertFalse(self.app.values[0].get("VSET", "")
+                             .startswith("77.5"))
+            self.app.exit()
+
+    async def test_switching_modules_forgets_the_selection(self):
+        async with self.app.run_test() as pilot:
+            worker = await self.connected(pilot)
+            await pilot.press("a")
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.pause()
+            await pilot.press("y")                   # yes, disconnect is fine
+            await pilot.pause()
+            # The picker can still be cancelled, and that keeps the link --
+            # so it has to keep the selection too.
+            self.assertEqual(self.app.selected, set(range(8)))
+            self.app.screen.query_one("#profiles", DataTable).move_cursor(row=2)
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: self.app.worker is not worker
+                              and self.app._rows_built)
+            self.assertEqual(self.app.selected, set())
+            self.app.exit()
+
+
+class TheLog(PanelTest):
+    """Everything the operator changes ends up in the log.
+
+    The panel's log is the only record of a session in front of a live
+    supply, so a reading of it afterwards should say what was done and to
+    what -- not just the SETs, but what they were aimed at.
+    """
+
+    async def connected(self, pilot):
+        await pilot.pause()
+        await pilot.press("down", "down", "enter")     # the simulator
+        await self.settle(pilot, lambda: self.app._rows_built)
+        self.app.query_one("#chans", DataTable).focus()
+
+    async def test_selection_changes_are_recorded(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("s", "down", "s")
+            await pilot.pause()
+            self.assertIn("selected 0-1", self.log_text())
+            await pilot.press("u")
+            await pilot.pause()
+            self.assertIn("selection cleared", self.log_text())
+            self.app.exit()
+
+    async def test_the_poll_rate_is_recorded_when_it_changes(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("plus")
+            await pilot.pause()
+            self.assertIn("poll every 0.4s", self.log_text())
+            self.app.exit()
+
+    async def test_a_rate_already_at_its_limit_is_not_recorded(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            for _ in range(3):        # 0.2s is already under the 0.25s floor
+                await pilot.press("minus")
+            await pilot.pause()
+            self.assertEqual(self.app.interval, 0.25)
+            self.assertEqual(self.log_text().count("poll every 0.25s"), 1)
+            self.app.exit()
+
+    async def test_a_write_is_recorded_with_its_channel_and_value(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "right", "enter")   # CH1 VSet
+            await pilot.pause()
+            self.app.screen.query_one("#value", Input).value = "42.0"
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: self.app.values[1]
+                              .get("VSET", "").startswith("42"))
+            self.assertIn("CH1 VSET = 42.0", self.log_text())
+            self.app.exit()
+
+    async def test_profile_edits_reach_the_panel_log(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("m")                    # back to the picker
+            await pilot.pause()
+            await pilot.press("y")                    # yes, the sim is live
+            await pilot.pause()
+            self.app.screen.query_one("#profiles", DataTable).move_cursor(row=0)
+            await pilot.press("d")                    # delete Lab rack A
+            await pilot.pause()
+            await pilot.press("y")
+            await self.settle(pilot, lambda: "Lab rack A"
+                              not in self.saved_names())
+            await pilot.press("escape")               # keep the current link
+            await pilot.pause()
+            self.assertIn("profile Lab rack A deleted", self.log_text())
+            self.app.exit()
+
+
+class AdjustingChannels(PanelTest):
+    """`d` shifts a setpoint by a step, from wherever each channel sits.
+
+    The simulator starts with VSET 0, 1500, 1500, 2400 on channels 0-3, and
+    its descriptor puts VSET in 0..4000 V.
+    """
+
+    async def connected(self, pilot):
+        await pilot.pause()
+        await pilot.press("down", "down", "enter")
+        await self.settle(pilot, lambda: self.app._rows_built)
+        self.app.query_one("#chans", DataTable).focus()
+
+    def preview(self) -> str:
+        return self.app.screen.query_one("#plan", Static).render().plain
+
+    async def test_it_previews_a_new_value_for_every_channel(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "s", "down", "s")   # channels 1 and 2
+            await pilot.press("right", "d")               # VSet column
+            await pilot.pause()
+            self.assertIn("(2 channels)", self.screen_text())
+            self.app.screen.query_one("#step", Input).value = "50"
+            await pilot.pause()
+            plan = self.preview()
+            self.assertIn("1550.0", plan)
+            self.assertEqual(plan.count("→"), 2)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.app.exit()
+
+    async def test_a_step_is_applied_to_every_selected_channel(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "s", "down", "s")   # 1 and 2, both 1500
+            await pilot.press("right", "d")
+            await pilot.pause()
+            self.app.screen.query_one("#step", Input).value = "-100"
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: all(
+                self.app.values[c].get("VSET", "").startswith("1400")
+                for c in (1, 2)))
+            self.assertTrue(self.app.values[3].get("VSET", "")
+                            .startswith("2400"))
+            self.app.exit()
+
+    async def test_channels_keep_their_own_starting_points(self):
+        """The point of a step: two different setpoints stay different."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "s", "down", "down", "s")   # 1 and 3
+            await pilot.press("right", "d")
+            await pilot.pause()
+            self.app.screen.query_one("#step", Input).value = "100"
+            await pilot.press("enter")
+            await self.settle(pilot, lambda:
+                              self.app.values[1].get("VSET", "")
+                              .startswith("1600")
+                              and self.app.values[3].get("VSET", "")
+                              .startswith("2500"))
+            self.app.exit()
+
+    async def test_with_no_selection_it_adjusts_the_cursor_channel(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "right", "d")      # CH1 VSet
+            await pilot.pause()
+            self.assertIn("Adjust CH 1", self.screen_text())
+            self.assertNotIn("channels)", self.screen_text())
+            self.app.screen.query_one("#step", Input).value = "25"
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: self.app.values[1]
+                              .get("VSET", "").startswith("1525"))
+            self.assertTrue(self.app.values[2].get("VSET", "")
+                            .startswith("1500"))
+            self.app.exit()
+
+    async def test_a_step_that_leaves_the_range_is_refused(self):
+        """One step, many starting points: the channel it does not suit is
+        named, and nothing is written -- not even to the channels it fits."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "s", "down", "down", "s")   # 1 and 3
+            await pilot.press("right", "d")
+            await pilot.pause()
+            self.app.screen.query_one("#step", Input).value = "1700"
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            self.assertIn("CH 3", self.error_text())        # 2400 + 1700
+            self.assertEqual(len(self.app.screen.query("#step")), 1)  # still up
+            self.assertTrue(self.app.values[1].get("VSET", "")
+                            .startswith("1500"))
+            await pilot.press("escape")
+            await pilot.pause()
+            self.app.exit()
+
+    async def test_a_read_only_column_is_not_adjustable(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("right", "right", "d")     # VMon
+            await pilot.pause()
+            self.assertEqual(len(self.app.screen.query("#step")), 0)
+            self.app.exit()
+
+    async def test_a_two_valued_column_is_not_adjustable(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            table = self.app.query_one("#chans", DataTable)
+            col = next(i for i, c in enumerate(self.app.columns)
+                       if c.par == "PDWN")
+            table.move_cursor(column=col + 1)
+            await pilot.press("d")
+            await pilot.pause()
+            self.assertEqual(len(self.app.screen.query("#step")), 0)
+            self.app.exit()
+
+    async def test_read_only_mode_refuses_to_adjust(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.app.read_only = True
+            await pilot.press("right", "d")
+            await pilot.pause()
+            self.assertEqual(len(self.app.screen.query("#step")), 0)
+            self.app.exit()
+
+
+class TableWidth(PanelTest):
+    """The status column takes whatever the terminal has spare."""
+
+    async def connected(self, pilot):
+        await pilot.pause()
+        await pilot.press("down", "down", "enter")
+        await self.settle(pilot, lambda: self.app._rows_built)
+
+    def widths(self) -> tuple[int, int, int]:
+        """(status width, width used by every other column, table width)."""
+        table = self.app.query_one("#chans", DataTable)
+        status, used = 0, 0
+        for key, column in table.columns.items():
+            if key.value == "STATUS":
+                status = column.width
+            else:
+                used += column.get_render_width(table)
+        return status, used, table.scrollable_content_region.width
+
+    async def test_a_wide_terminal_is_filled(self):
+        async with self.app.run_test(size=(140, 26)) as pilot:
+            await self.connected(pilot)
+            status, used, width = self.widths()
+            self.assertGreater(status, 30)
+            self.assertEqual(used + status + 2, width)   # no wasted columns
+            self.app.exit()
+
+    async def test_eighty_columns_keeps_the_declared_widths(self):
+        """The narrowest terminal the panel is meant for: it scrolls instead
+        of squeezing numbers that have to stay readable."""
+        async with self.app.run_test(size=(80, 26)) as pilot:
+            await self.connected(pilot)
+            self.assertEqual(self.widths()[0], 30)
+            self.app.exit()
+
+    async def test_it_follows_the_terminal_resizing(self):
+        async with self.app.run_test(size=(140, 26)) as pilot:
+            await self.connected(pilot)
+            grown = self.widths()[0]
+            await pilot.resize_terminal(80, 26)
+            await pilot.pause(0.2)
+            self.assertEqual(self.widths()[0], 30)
+            await pilot.resize_terminal(180, 26)
+            await pilot.pause(0.2)
+            self.assertGreater(self.widths()[0], grown)
+            status, used, width = self.widths()
+            self.assertEqual(used + status + 2, width)
             self.app.exit()
 
 

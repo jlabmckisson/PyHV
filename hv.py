@@ -420,6 +420,10 @@ class ParamInfo:
             return f"{self.minimum} .. {self.maximum} {self.unit}".strip()
         return self.unit
 
+    def format(self, value: float) -> str:
+        """Render a number the way this parameter is written on the wire."""
+        return f"{value:.{self.prec}f}" if self.prec else f"{value:g}"
+
     def validate(self, text: str) -> str:
         """Normalise user input for this parameter or raise ValueError.
 
@@ -448,7 +452,7 @@ class ParamInfo:
                 if not ok(f, b):
                     raise ValueError(
                         f"outside {self.minimum}..{self.maximum} {self.unit}")
-        return f"{f:.{self.prec}f}" if self.prec else f"{f:g}"
+        return self.format(f)
 
 
 class Device:

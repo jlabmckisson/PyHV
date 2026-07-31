@@ -26,7 +26,7 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
@@ -73,14 +73,53 @@ COLUMNS: list[Column] = [
     Column("STATUS",  "Status",  30, align="left"),
 ]
 
+# The column that absorbs whatever width the terminal has spare.  Every other
+# one holds a number of known width; the status flags are an open-ended list,
+# so extra room is worth more there than as blank space down the right edge.
+# It never shrinks below its declared width -- at 80 columns the table scrolls,
+# which is the narrowest terminal the panel is meant for.
+STRETCH = "STATUS"
+
 # Column 0 of the table is the channel number, which is not a parameter.
 CH_COL = 1
+
 
 BOARD_STATIC = ["BDNAME", "BDSNUM", "BDFREL", "BDHVMAX", "BDHIMAX", "BDILKM"]
 BOARD_FAST = ["BDILK", "BDALARM"]       # safety-relevant, every poll
 BOARD_SLOW = ["BDCTR"]                  # LOCAL/REMOTE, changes at the panel
 
 SLOW_EVERY = 6      # poll the `fast=False` parameters once every N cycles
+
+
+def fmt_channels(chs) -> str:
+    """0,1,2,3,6 -> "0-3,6".
+
+    A sixteen-channel selection spelled out in full does not fit a dialog
+    title, and the whole point of naming the channels is that they are read
+    before something is written to them.
+    """
+    out: list[str] = []
+    chs = sorted(chs)
+    i = 0
+    while i < len(chs):
+        j = i
+        while j + 1 < len(chs) and chs[j + 1] == chs[j] + 1:
+            j += 1
+        out.append(str(chs[i]) if j == i else f"{chs[i]}-{chs[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+class ChannelTable(DataTable):
+    """The channel table, which refits its columns when the terminal changes.
+
+    It has to notice the resize itself: `Resize` does not bubble, and by the
+    time the App hears about its own resize the table has not been given its
+    new region yet.
+    """
+
+    def on_resize(self) -> None:
+        self.app.fit_columns()
 
 
 # --------------------------------------------------------------------------
@@ -354,11 +393,15 @@ class ConfirmScreen(ArrowFocus, ModalScreen[bool]):
 
 
 class EditScreen(ArrowFocus, ModalScreen[str | None]):
-    """Edit one parameter of one channel.
+    """Edit one parameter of one channel, or of every selected channel.
 
     Numeric parameters get a text field validated against the module's own
     INFO descriptor; two-valued ones (PDWN, IMRANGE) get a button per state,
     which avoids typing a string the module will only reject.
+
+    The title names every channel that will be written to.  With more than one
+    target the dialog is the only place that says so before the write goes
+    out, so it says it plainly.
     """
 
     # left/right only ever reach the screen when a Button has focus -- a
@@ -369,26 +412,33 @@ class EditScreen(ArrowFocus, ModalScreen[str | None]):
         Binding("right", "focus_next", "", show=False),
     ]
 
-    def __init__(self, ch: int, col: Column, current: str, info: ParamInfo):
+    def __init__(self, channels: list[int], col: Column, current: str,
+                 info: ParamInfo, mixed: bool = False):
         super().__init__()
-        self.ch = ch
+        self.channels = channels
         self.col = col
         self.current = current
         self.info = info
+        self.mixed = mixed          # the targets do not all hold one value
         self.choices = info.choices
 
     def compose(self) -> ComposeResult:
+        n = len(self.channels)
         with Vertical(id="dialog"):
-            yield Label(f"CH {self.ch}  •  {self.col.par}", id="dlg-title")
+            title = f"CH {fmt_channels(self.channels)}"
+            if n > 1:
+                title += f"  ({n} channels)"
+            yield Label(f"{title}  •  {self.col.par}", id="dlg-title")
             hint = self.info.range_text() or "no descriptor from module"
-            yield Label(f"current {self.current or '--'}    range {hint}",
-                        id="dlg-detail")
+            cur = "mixed" if self.mixed else (self.current or "--")
+            yield Label(f"current {cur}    range {hint}", id="dlg-detail")
             if self.choices:
                 with Horizontal(id="dlg-buttons"):
                     for i, choice in enumerate(self.choices):
                         yield Button(choice, id=f"choice-{i}",
                                      variant="primary"
-                                     if choice.upper() == self.current.upper()
+                                     if not self.mixed and choice.upper()
+                                     == self.current.upper()
                                      else "default")
             else:
                 yield Input(value=self.current, id="value")
@@ -425,6 +475,145 @@ class EditScreen(ArrowFocus, ModalScreen[str | None]):
             self.dismiss(self.info.validate(raw))
         except ValueError as e:
             self.query_one("#dlg-error", Label).update(Text(str(e), "bold red"))
+
+
+class AdjustScreen(ArrowFocus, ModalScreen["dict[int, str] | None"]):
+    """Shift one numeric parameter of every target channel by a step.
+
+    A relative change lands on a different number in every channel, so the
+    dialog writes out what each one will be set to rather than leaving the
+    arithmetic to a reader standing in front of a live supply.  It returns
+    those numbers, already absolute: the protocol has no relative SET.
+
+    Only setpoints are editable, and a setpoint does not move on its own, so
+    the readings this starts from stay true while the dialog is open.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss(None)", "Cancel", show=False),
+        Binding("left", "focus_previous", "", show=False),
+        Binding("right", "focus_next", "", show=False),
+    ]
+
+    def __init__(self, channels: list[int], col: Column, info: ParamInfo,
+                 currents: dict[int, str]):
+        super().__init__()
+        self.channels = channels
+        self.col = col
+        self.info = info
+        self.currents = currents
+
+    def compose(self) -> ComposeResult:
+        n = len(self.channels)
+        with Vertical(id="dialog"):
+            title = f"Adjust CH {fmt_channels(self.channels)}"
+            if n > 1:
+                title += f"  ({n} channels)"
+            yield Label(f"{title}  •  {self.col.par}", id="dlg-title")
+            hint = self.info.range_text() or "no descriptor from module"
+            yield Label(f"step — 50 raises, -50 lowers    range {hint}",
+                        id="dlg-detail")
+            yield Input(placeholder="e.g. 50 or -25", id="step")
+            with VerticalScroll(id="preview"):
+                yield Static(id="plan")
+            yield Label("", id="dlg-error")
+            with Horizontal(id="dlg-buttons"):
+                yield Button("Apply", variant="primary", id="apply")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#step", Input).focus()
+        self._repaint()
+
+    @on(Input.Changed)
+    def _changed(self) -> None:
+        self._repaint()
+
+    @on(Input.Submitted)
+    def _submitted(self) -> None:
+        self._submit()
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def _step(self) -> float | None:
+        """The step as typed, or None while there is nothing to apply yet."""
+        raw = self.query_one("#step", Input).value.strip()
+        if raw.startswith("+"):         # explicit sign, the same as none
+            raw = raw[1:].strip()
+        if not raw or raw == "-":       # mid-keystroke, not an error yet
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            raise ValueError(f"{raw!r} is not a number")
+
+    def _plan(self) -> tuple[list[tuple[int, str, str, str]], str]:
+        """([(channel, current, new, problem)], error) for the step as typed.
+
+        A channel whose reading has not arrived, or whose result the module's
+        own descriptor puts out of range, is a problem: with one step and many
+        different starting points, the reader cannot be expected to have
+        spotted the one channel it does not suit.
+        """
+        step = self._step()
+        rows: list[tuple[int, str, str, str]] = []
+        bad: list[int] = []
+        for c in self.channels:
+            cur = self.currents.get(c, "").strip()
+            if step is None:
+                rows.append((c, cur or "--", "", ""))
+                continue
+            try:
+                base = float(cur)
+            except ValueError:
+                rows.append((c, cur or "--", "?", f"no {self.col.par} reading"))
+                bad.append(c)
+                continue
+            new = self.info.format(base + step)
+            try:
+                rows.append((c, cur, self.info.validate(new), ""))
+            except ValueError as e:
+                rows.append((c, cur, new, str(e)))
+                bad.append(c)
+        if not bad:
+            return rows, ""
+        problem = next(r[3] for r in rows if r[3])
+        return rows, f"CH {fmt_channels(bad)}: {problem}"
+
+    def _repaint(self) -> None:
+        try:
+            rows, err = self._plan()
+        except ValueError as e:
+            rows, err = [], str(e)
+        body = Text()
+        for i, (ch, cur, new, problem) in enumerate(rows):
+            if i:
+                body.append("\n")
+            body.append(f"CH {ch:>2}  ")
+            body.append(f"{cur:>10}", "dim")
+            if new:
+                body.append("  →  ")
+                body.append(f"{new:>10}", "bold red" if problem else "bold")
+        self.query_one("#plan", Static).update(body)
+        self.query_one("#dlg-error", Label).update(
+            Text(err, "bold red") if err else Text(""))
+
+    def _submit(self) -> None:
+        try:
+            rows, err = self._plan()
+        except ValueError as e:
+            rows, err = [], str(e)
+        if not err and not any(new for _, _, new, _ in rows):
+            err = "step required"
+        if err:
+            self.query_one("#dlg-error", Label).update(Text(err, "bold red"))
+            return
+        self.dismiss({ch: new for ch, _cur, new, _problem in rows})
 
 
 # --------------------------------------------------------------------------
@@ -617,6 +806,14 @@ class ConnectScreen(ModalScreen["Profile | None"]):
     def _error(self, message: str) -> None:
         self.query_one("#dlg-error", Label).update(Text(message, "bold red"))
 
+    def _log(self, markup: str) -> None:
+        """Edits to the profile store go in the panel's log too -- it is the
+        one place that records what the operator did this session, and the
+        dialog itself is gone by the time anyone reads it."""
+        log_line = getattr(self.app, "log_line", None)
+        if log_line is not None:
+            log_line(markup)
+
     def _persist(self) -> bool:
         try:
             self.store.save()
@@ -649,6 +846,8 @@ class ConnectScreen(ModalScreen["Profile | None"]):
             return
         self.store.upsert(prof)
         if self._persist():
+            self._log(f"[cyan]profile {prof.name} added ({prof.address})"
+                      f"[/cyan]")
             self._reload(select=prof.name)
 
     @work
@@ -663,6 +862,9 @@ class ConnectScreen(ModalScreen["Profile | None"]):
             return
         self.store.upsert(edited, old_name=prof.name)
         if self._persist():
+            what = (f"{prof.name} renamed to {edited.name}"
+                    if edited.name != prof.name else f"{edited.name} edited")
+            self._log(f"[cyan]profile {what} ({edited.address})[/cyan]")
             self._reload(select=edited.name)
 
     @work
@@ -679,6 +881,7 @@ class ConnectScreen(ModalScreen["Profile | None"]):
             return
         self.store.delete(prof.name)
         if self._persist():
+            self._log(f"[cyan]profile {prof.name} deleted[/cyan]")
             self._reload()
 
 
@@ -703,7 +906,8 @@ class HVApp(App):
         padding: 0 1;
         background: $surface;
     }
-    ConfirmScreen, EditScreen, ConnectScreen, ProfileEditScreen {
+    ConfirmScreen, EditScreen, AdjustScreen, ConnectScreen,
+    ProfileEditScreen {
         align: center middle;
     }
     #dialog {
@@ -718,6 +922,15 @@ class HVApp(App):
     #dlg-title { text-style: bold; width: 100%; }
     #dlg-detail { color: $text-muted; width: 100%; margin-bottom: 1; }
     #dlg-error { width: 100%; height: 1; }
+    /* Sixteen channels would push the buttons off a short terminal, so the
+       plan scrolls once it is taller than half a dozen lines. */
+    #preview {
+        height: auto;
+        max-height: 6;
+        margin-top: 1;
+        padding: 0 1;
+        background: $panel;
+    }
     #dlg-buttons { height: auto; align-horizontal: right; margin-top: 1; }
     #dlg-buttons Button { margin-left: 2; }
     .field { height: auto; margin-bottom: 1; }
@@ -733,6 +946,18 @@ class HVApp(App):
         Binding("o", "power(True)", "On"),
         Binding("f", "power(False)", "Off"),
         Binding("X", "all_off", "ALL OFF"),
+        Binding("s", "select_toggle", "Select"),
+        # Enter sets one value on every target; `d` shifts each target from
+        # wherever it already is, which a single SET cannot express.
+        Binding("d", "adjust", "Adjust ±"),
+        # The footer already has more keys than an 80-column terminal shows;
+        # the board line names `u` instead, and only while there is a
+        # selection to clear.
+        Binding("u", "select_none", "Unselect all", show=False),
+        Binding("a", "select_all", "Select all", show=False),
+        # Escape clears the selection only here: a modal defines its own keys,
+        # so it still means "cancel this dialog" wherever one is open.
+        Binding("escape", "select_none", "", show=False),
         Binding("c", "clear_alarm", "Clear alarm"),
         Binding("r", "refresh", "Refresh"),
         Binding("p", "pause", "Pause"),
@@ -761,6 +986,9 @@ class HVApp(App):
         self.board: dict[str, str] = {}
         self.flags: list[list[str]] = []
         self.values: list[dict[str, str]] = []
+        # Channels an edit applies to.  Empty means "the one under the cursor",
+        # which is how the panel behaved before there was a selection at all.
+        self.selected: set[int] = set()
         self.worker: DeviceWorker | None = None
         self._rows_built = False
         self._last_error: str | None = None
@@ -770,7 +998,8 @@ class HVApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield Static("connecting…", id="board")
-        yield DataTable(id="chans", cursor_type="cell", zebra_stripes=True)
+        yield ChannelTable(id="chans", cursor_type="cell",
+                           zebra_stripes=True)
         yield RichLog(id="log", markup=True, wrap=True, max_lines=500)
         yield Footer()
 
@@ -816,6 +1045,7 @@ class HVApp(App):
         self.columns = []
         self.info, self.board = {}, {}
         self.flags, self.values = [], []
+        self.selected.clear()       # another module's channels are not these
         self._rows_built = False
         self._last_error = None
         if self.is_running:
@@ -880,16 +1110,18 @@ class HVApp(App):
         self.board.update(board)
         self.flags = [[] for _ in range(nch)]
         self.values = [{} for _ in range(nch)]
+        self.selected.clear()
         table = self.query_one("#chans", DataTable)
         table.clear(columns=True)
-        table.add_column(Text("CH", justify="right"), width=3, key="CH")
+        # One wider than the channel number needs, for the selection mark.
+        table.add_column(Text("CH", justify="right"), width=4, key="CH")
         for col in columns:
             table.add_column(Text(col.title, justify=col.align),
                              width=col.width, key=col.par)
         for c in range(nch):
-            table.add_row(Text(str(c), justify="right"),
-                          *["" for _ in columns], key=f"ch{c}")
+            table.add_row(self._ch_cell(c), *["" for _ in columns], key=f"ch{c}")
         self._rows_built = True
+        self.fit_columns()
         name = board.get("BDNAME", "?")
         self.log_line(f"[green]{name}[/green]  sn {board.get('BDSNUM', '?')}"
                       f"  fw {board.get('BDFREL', '?')}  {nch} channels")
@@ -934,6 +1166,7 @@ class HVApp(App):
                 table.remove_column(name)
             except Exception:
                 pass        # a board parameter, which has no column
+        self.fit_columns()     # the width it held is now free
         self.log_line(f"[yellow]{', '.join(names)}: unknown to this module — "
                       f"no longer polled[/yellow]")
 
@@ -957,6 +1190,52 @@ class HVApp(App):
             for col in self.columns:
                 table.update_cell(f"ch{c}", col.par,
                                   self._cell(col, row, flags))
+
+    def fit_columns(self) -> None:
+        """Hand the width the table is not using to the STRETCH column.
+
+        Textual has no public way to resize a column after the fact, so the
+        width is set on the Column record and the table is told its dimensions
+        are stale -- the same flag its own `add_column` sets.
+        """
+        if not self._rows_built:
+            return
+        table = self.query_one("#chans", DataTable)
+        pad = 2 * table.cell_padding
+        stretch, used = None, 0
+        for key, column in table.columns.items():
+            if key.value == STRETCH:
+                stretch = column
+            else:
+                used += column.get_render_width(table)
+        if stretch is None:      # this module has no status column
+            return
+        base = next((c.width for c in COLUMNS if c.par == STRETCH), 30)
+        want = max(base, table.scrollable_content_region.width - used - pad)
+        if want == stretch.width:
+            return
+        stretch.width = want
+        table._require_update_dimensions = True
+        table.refresh()
+
+    def _ch_cell(self, ch: int) -> Text:
+        """The channel-number cell, carrying the selection mark.
+
+        A glyph rather than only a colour: on a monochrome terminal, or over a
+        zebra stripe, colour alone is not enough to tell what a write is about
+        to reach.
+        """
+        if ch in self.selected:
+            return Text(f"*{ch}", "bold cyan", justify="right")
+        return Text(str(ch), justify="right")
+
+    def _paint_selection(self) -> None:
+        if not self._rows_built:
+            return
+        table = self.query_one("#chans", DataTable)
+        for c in range(self.nch):
+            table.update_cell(f"ch{c}", "CH", self._ch_cell(c))
+        self._paint_board(time.time())      # the board line carries the count
 
     def _cell(self, col: Column, row: dict[str, str], flags: list[str]) -> Text:
         raw = row.get(col.par, "")
@@ -1039,6 +1318,9 @@ class HVApp(App):
         line.append(f"   {time.strftime('%H:%M:%S', time.localtime(stamp))}",
                     "dim")
         line.append(f"  {self.interval:g}s", "dim")
+        if self.selected:
+            line.append(f"  sel {fmt_channels(self.selected)}", "bold cyan")
+            line.append(" (u clears)", "dim")
         if paused:
             line.append("  PAUSED", "bold yellow")
         if self.read_only:
@@ -1097,15 +1379,97 @@ class HVApp(App):
         if not self._guard():
             return
         ch = coord.row
+        # A selection is what an edit applies to; with none, the cell under the
+        # cursor.  The dialog names every channel it is about to write to.
+        targets = sorted(self.selected) if self.selected else [ch]
         info = self.info.get(col.par, ParamInfo(access=2))
-        current = self.values[ch].get(col.par, "")
-        value = await self.push_screen_wait(EditScreen(ch, col, current, info))
+        # Prefill from a channel that is actually a target, which the cursor
+        # need not be once a selection exists.
+        ref = ch if ch in targets else targets[0]
+        current = self.values[ref].get(col.par, "")
+        mixed = len({self.values[c].get(col.par, "").upper()
+                     for c in targets}) > 1
+        value = await self.push_screen_wait(
+            EditScreen(targets, col, current, info, mixed))
         if value is None:
             return
+        self._write(col, {c: value for c in targets})
+
+    @work
+    async def action_adjust(self) -> None:
+        """Shift the column under the cursor by a step, on every target.
+
+        The parameter comes from the cursor rather than a dialog: the column
+        is already what the cursor picks for an edit, and one selection is
+        often adjusted a few times in a row.
+        """
+        if not self._rows_built:
+            return
+        table = self.query_one("#chans", DataTable)
+        idx = table.cursor_column - CH_COL
+        if idx < 0 or idx >= len(self.columns):
+            return
+        col = self.columns[idx]
+        info = self.info.get(col.par, ParamInfo(access=2))
+        if not col.editable:
+            self.notify(f"{col.par} is read-only", severity="warning")
+            return
+        if info.choices:
+            # RAMP/KILL and HIGH/LOW have nothing to add a step to.
+            self.notify(f"{col.par} is not a number — press enter to set it",
+                        severity="warning")
+            return
+        if not self._guard():
+            return
+        targets = (sorted(self.selected) if self.selected
+                   else [self.cursor_channel])
+        plan = await self.push_screen_wait(AdjustScreen(
+            targets, col, info, {c: self.values[c].get(col.par, "")
+                                 for c in targets}))
+        if plan:
+            self._write(col, plan)
+
+    def _write(self, col: Column, plan: dict[int, str]) -> None:
+        """One SET per channel -- the protocol has no multi-channel write."""
         # Write with the module's own name for the parameter, not ours.
         wire = self.worker.wire_name(col.par) if self.worker else col.par
-        label = f"CH{ch} {col.par} = {value}"
-        self.submit(label, lambda d: d.set_ch(ch, wire, value))
+        for c, value in plan.items():
+            self.submit(f"CH{c} {col.par} = {value}",
+                        lambda d, c=c, v=value: d.set_ch(c, wire, v))
+
+    # Selection is not a write, so it is not behind `_guard`: it stays usable
+    # in read-only mode and while the module is in LOCAL.
+
+    def action_select_toggle(self) -> None:
+        if not self._rows_built:
+            return
+        ch = self.cursor_channel
+        self.selected.symmetric_difference_update({ch})
+        self._paint_selection()
+        self._log_selection()
+
+    def action_select_all(self) -> None:
+        if not self._rows_built:
+            return
+        self.selected = set(range(self.nch))
+        self._paint_selection()
+        self._log_selection()
+
+    def action_select_none(self) -> None:
+        if not self.selected:
+            return
+        self.selected.clear()
+        self._paint_selection()
+        self._log_selection()
+
+    def _log_selection(self) -> None:
+        """The selection decides what the next write lands on, so it belongs
+        in the same record as the writes themselves."""
+        if self.selected:
+            self.log_line(f"[cyan]selected {fmt_channels(self.selected)}"
+                          f"[/cyan]")
+        else:
+            self.log_line("[cyan]selection cleared[/cyan]")
 
     def action_toggle(self) -> None:
         if not self._rows_built:
@@ -1167,6 +1531,7 @@ class HVApp(App):
 
     def action_refresh(self) -> None:
         if self.worker:
+            self.log_line("[dim]refresh[/dim]")
             self.worker.refresh_now()
 
     def action_pause(self) -> None:
@@ -1184,7 +1549,12 @@ class HVApp(App):
         self._set_interval(max(0.25, self.interval / 2))
 
     def _set_interval(self, value: float) -> None:
+        # `+` at 30s and `-` at 0.25s are no-ops; saying so beats a log line
+        # that claims a change nobody made.
+        if value == self.interval:
+            return
         self.interval = value
+        self.log_line(f"[yellow]poll every {value:g}s[/yellow]")
         if self.worker:
             self.worker.interval = value
             self.worker.refresh_now()
