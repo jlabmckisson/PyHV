@@ -29,12 +29,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Runner labels are dated goods, and a retired one does not fail --
+          # it queues for a runner that will never come.  Checked 2026-07-31;
+          # the date on each line is when it stops working.
+          #
           # Not ubuntu-latest: PyInstaller links the build machine's glibc, so
           # the oldest runner available sets how old a lab box may be.
-          - {os: ubuntu-22.04,  name: linux-x86_64,  binary: hvctl}
-          - {os: macos-14,      name: macos-arm64,   binary: hvctl}
-          - {os: macos-13,      name: macos-x86_64,  binary: hvctl}
-          - {os: windows-2022,  name: windows-x86_64, binary: hvctl.exe}
+          - {os: ubuntu-22.04,     name: linux-x86_64,   binary: hvctl}      # brownouts from 2026-09-17, gone 2027-04-17
+          - {os: macos-15,         name: macos-arm64,    binary: hvctl}
+          # The last Intel image Actions will ever have.  When it goes, so does
+          # the x86_64 Mac binary -- there will be nothing left to build it on.
+          - {os: macos-15-intel,   name: macos-x86_64,   binary: hvctl}      # gone 2027-08
+          - {os: windows-2022,     name: windows-x86_64, binary: hvctl.exe}
 
     steps:
       - uses: actions/checkout@v4
