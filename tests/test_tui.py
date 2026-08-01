@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hv import STATUS_BITS, STATUS_HELP                        # noqa: E402
 from hvprofiles import SIM_PROFILE, Profile, ProfileStore      # noqa: E402
 from hvtui import (HELP_SECTIONS, HELP_WIDTH, ConnectScreen,   # noqa: E402
-                   HVApp, HelpScreen, NameScreen, ProfileEditScreen)
+                   HVApp, HelpScreen, ModuleTabs, NameScreen,
+                   ProfileEditScreen)
 from textual.widgets import (DataTable, Input, Label,          # noqa: E402
                              RichLog, Static)
 
@@ -85,6 +86,28 @@ class PanelTest(unittest.IsolatedAsyncioTestCase):
         await self.settle(pilot, lambda: self.app._rows_built
                           and all(self.app.values))
         return self.app.worker
+
+    async def second(self, pilot, name: str = "Bench sim"):
+        """Open a second module, so the panel is holding two tabs.
+
+        Another simulator rather than one of the saved addresses: a tab has to
+        connect before there is anything to switch to, and nothing in these
+        tests is reachable except the built-in module.  A `sim` profile is
+        never written to the store, so adding one here leaves no trace.
+        """
+        self.app.store.profiles.append(Profile(name, kind="sim"))
+        await pilot.press("m")
+        await pilot.pause()
+        names = [p.name for p in self.app.screen.rows]
+        self.app.screen.query_one("#profiles", DataTable).move_cursor(
+            row=names.index(name))
+        await pilot.press("enter")
+        await self.settle(pilot, lambda: len(self.app.modules) == 2
+                          and self.app._rows_built and all(self.app.values))
+        return self.app.modules[-1]
+
+    def tab_bar(self) -> str:
+        return self.app.query_one(ModuleTabs).render().plain
 
 
 class ModulePicker(PanelTest):
@@ -377,43 +400,57 @@ class EditingProfiles(PanelTest):
             self.app.exit()
 
 
-class SwitchingModules(PanelTest):
+class ConnectingMoreModules(PanelTest):
+    """`m` adds a module rather than replacing the one already connected."""
 
-    async def test_switching_warns_while_channels_are_live(self):
+    async def test_another_module_opens_in_its_own_tab(self):
         async with self.app.run_test() as pilot:
-            await self.connected(pilot)
-            await pilot.press("m")
-            await pilot.pause()
-            self.assertIn("Disconnect with channels live", self.screen_text())
+            worker = await self.connected(pilot)
+            await self.second(pilot)
+            self.assertEqual(len(self.app.modules), 2)
+            # The first is still connected and still polling: nothing about
+            # opening a second supply should disturb the first.
+            self.assertIsNotNone(self.app.modules[0].worker)
+            self.assertFalse(worker._stop.is_set())
+            self.assertIn("Simulator", self.tab_bar())
+            self.assertIn("Bench sim", self.tab_bar())
             self.app.exit()
 
-    async def test_switching_warns_before_the_first_reading(self):
-        """Nothing read is not nothing energised, and is not treated as it.
-
-        The panel looks the same in both cases -- empty flags -- for as long as
-        it takes the first poll to come back, which on a module answering at
-        9600 baud is not instant.
-        """
+    async def test_nothing_is_disconnected_so_nothing_is_warned_about(self):
+        """The old `m` dropped the link and had to ask.  This one does not."""
         async with self.app.run_test() as pilot:
             await self.connected(pilot)
-            self.app.worker.paused = True            # no poll to refill them
-            await pilot.pause(0.3)                   # let one in flight land
-            nch = self.app.nch
-            self.app.flags = [[] for _ in range(nch)]     # what on_device_ready
-            self.app.values = [{} for _ in range(nch)]    # leaves behind
             await pilot.press("m")
             await pilot.pause()
-            body = self.screen_text()
-            self.assertIn("Disconnect before the first reading", body)
-            self.assertIn("not known here", body)
+            self.assertIsInstance(self.app.screen, ConnectScreen)
+            self.assertNotIn("stay energised", self.screen_text())
+            await pilot.press("escape")
+            await pilot.pause()
+            self.app.exit()
+
+    async def test_a_module_already_open_is_switched_to_not_dialled_twice(self):
+        """Two tabs on one supply would double its poll traffic and then
+        disagree with each other about what it is doing."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.second(pilot)
+            await pilot.press("m")
+            await pilot.pause()
+            self.assertIn("open", self.screen_text())
+            names = [p.name for p in self.app.screen.rows]
+            self.app.screen.query_one("#profiles", DataTable).move_cursor(
+                row=names.index("Simulator"))
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(len(self.app.modules), 2)
+            self.assertEqual(self.app.active_index, 0)   # went to it instead
+            self.assertIn("already open", self.log_text())
             self.app.exit()
 
     async def test_cancelling_the_picker_keeps_the_link(self):
         async with self.app.run_test() as pilot:
             worker = await self.connected(pilot)
             await pilot.press("m")
-            await pilot.pause()
-            await pilot.press("y")                   # yes, disconnect is fine
             await pilot.pause()
             self.assertIsInstance(self.app.screen, ConnectScreen)
             self.assertIn("Cancel", self.screen_text())
@@ -430,8 +467,6 @@ class SwitchingModules(PanelTest):
             self.app.timeout = 0.4
             await pilot.press("m")
             await pilot.pause()
-            await pilot.press("y")
-            await pilot.pause()
             self.app.screen.query_one("#profiles", DataTable).move_cursor(row=2)
             self.assertEqual(self.app.screen.selected.name, "Nowhere")
             await pilot.press("enter")
@@ -439,24 +474,198 @@ class SwitchingModules(PanelTest):
                 self.app.screen, ConnectScreen) and self.app.screen.is_active)
             await pilot.pause(0.2)
             self.assertIsInstance(self.app.screen, ConnectScreen)
+            self.assertEqual(len(self.app.modules), 1)
             self.assertIs(self.app.worker, worker)
             self.app.exit()
 
-    async def test_reconnecting_rebuilds_the_table(self):
+
+class SwitchingTabs(PanelTest):
+    """Two modules at once: which one the panel is showing, and which one
+    every other key acts on."""
+
+    async def test_brackets_move_between_modules(self):
         async with self.app.run_test() as pilot:
-            worker = await self.connected(pilot)
-            await pilot.press("m")
+            await self.connected(pilot)
+            await self.second(pilot)
+            self.assertEqual(self.app.active_index, 1)
+            await pilot.press("left_square_bracket")
+            await pilot.pause()
+            self.assertEqual(self.app.active_index, 0)
+            self.assertIn("Simulator", self.app.sub_title)
+            await pilot.press("right_square_bracket")
+            await pilot.pause()
+            self.assertEqual(self.app.active_index, 1)
+            self.assertIn("Bench sim", self.app.sub_title)
+            self.app.exit()
+
+    async def test_a_digit_goes_straight_to_a_module(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.second(pilot)
+            await pilot.press("1")
+            await pilot.pause()
+            self.assertEqual(self.app.active_index, 0)
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertEqual(self.app.active_index, 1)
+            await pilot.press("7")                  # no seventh module
+            await pilot.pause()
+            self.assertEqual(self.app.active_index, 1)
+            self.app.exit()
+
+    async def test_the_table_follows_the_module_on_screen(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.second(pilot)
+            table = self.app.query_one("#chans", DataTable)
+            self.assertEqual(table.row_count, self.app.modules[1].nch)
+            await pilot.press("1")
+            await pilot.pause()
+            self.assertEqual(table.row_count, self.app.modules[0].nch)
+            self.assertTrue(self.app._rows_built)
+            self.app.exit()
+
+    async def test_a_tab_is_found_as_it_was_left(self):
+        """The cursor belongs to the module, not to the table: coming back to
+        a supply should not have moved what the next edit would reach."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.app.query_one("#chans", DataTable).focus()
+            await pilot.press("down", "down", "right")
+            await pilot.pause()
+            where = self.app.query_one("#chans", DataTable).cursor_coordinate
+            await self.second(pilot)
+            self.assertEqual(self.app.query_one("#chans", DataTable)
+                             .cursor_coordinate.row, 0)
+            await pilot.press("1")
+            await pilot.pause()
+            self.assertEqual(self.app.query_one("#chans", DataTable)
+                             .cursor_coordinate, where)
+            self.app.exit()
+
+    async def test_each_module_keeps_its_own_selection(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.app.query_one("#chans", DataTable).focus()
+            await pilot.press("a")                  # every channel, module 1
+            await pilot.pause()
+            self.assertEqual(self.app.selected, set(range(8)))
+            await self.second(pilot)
+            # Another module's channels are not these, so neither is a
+            # selection made against them.
+            self.assertEqual(self.app.selected, set())
+            await pilot.press("1")
+            await pilot.pause()
+            self.assertEqual(self.app.selected, set(range(8)))
+            self.app.exit()
+
+    async def test_the_bar_says_what_each_module_is_doing(self):
+        """A supply nobody is looking at is exactly the one worth marking."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.second(pilot)
+            await self.settle(pilot, lambda: all(self.app.modules[0].values))
+            # The simulator starts with channels energised, so both read live.
+            self.assertEqual(self.tab_bar().count("●"), 2)
+            await pilot.press("p")                  # pause the one on screen
+            await pilot.pause()
+            self.assertIn("‖", self.tab_bar())
+            self.assertEqual(self.tab_bar().count("‖"), 1)
+            self.app.exit()
+
+    async def test_a_module_off_screen_can_still_raise_its_hand(self):
+        """The whole point of holding several: a supply nobody is looking at
+        is exactly the one that trips unnoticed."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.second(pilot)
+            background = self.app.modules[0]
+            background.worker.paused = True         # no poll to overwrite it
+            await pilot.pause(0.3)                  # let one in flight land
+            background.board["BDILK"] = "YES"
+            self.app._paint_tabs()
+            await pilot.pause()
+            self.assertTrue(background.alarmed)
+            self.assertIn("!", self.tab_bar())
+            # And the board line is still the module on screen, which is fine.
+            self.assertNotIn("interlock YES", self.screen_text())
+            self.app.exit()
+
+
+class ClosingATab(PanelTest):
+    """`w` is the only thing in the panel that disconnects a supply."""
+
+    async def test_closing_warns_while_channels_are_live(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            body = self.screen_text()
+            self.assertIn("with channels live", body)
+            self.assertIn("stay energised", body)
+            self.app.exit()
+
+    async def test_closing_warns_before_the_first_reading(self):
+        """Nothing read is not nothing energised, and is not treated as it.
+
+        The panel looks the same in both cases -- empty flags -- for as long as
+        it takes the first poll to come back, which on a module answering at
+        9600 baud is not instant.
+        """
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.app.worker.paused = True            # no poll to refill them
+            await pilot.pause(0.3)                   # let one in flight land
+            nch = self.app.nch
+            self.app.flags = [[] for _ in range(nch)]     # what on_device_ready
+            self.app.values = [{} for _ in range(nch)]    # leaves behind
+            await pilot.press("w")
+            await pilot.pause()
+            body = self.screen_text()
+            self.assertIn("before the first reading", body)
+            self.assertIn("not known here", body)
+            self.app.exit()
+
+    async def test_the_prompt_names_the_module(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.second(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            self.assertIn("Close Bench sim", self.screen_text())
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(len(self.app.modules), 2)
+            self.app.exit()
+
+    async def test_a_closed_module_stops_polling_and_leaves_the_rest(self):
+        async with self.app.run_test() as pilot:
+            first = await self.connected(pilot)
+            await self.second(pilot)
+            second = self.app.worker
+            await pilot.press("w")
             await pilot.pause()
             await pilot.press("y")
+            await self.settle(pilot, lambda: len(self.app.modules) == 1)
+            self.assertTrue(second._stop.is_set())
+            self.assertFalse(first._stop.is_set())
+            self.assertEqual(self.app.active_index, 0)
+            self.assertIn("Simulator", self.app.sub_title)
+            self.assertIn("closed Bench sim", self.log_text())
+            self.app.exit()
+
+    async def test_closing_the_last_module_leaves_the_panel_disconnected(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("w")
             await pilot.pause()
-            self.app.screen.query_one("#profiles", DataTable).move_cursor(row=2)
-            await pilot.press("enter")
-            await self.settle(pilot, lambda: self.app.worker is not worker
-                              and self.app._rows_built)
-            self.assertTrue(worker._stop.is_set())
-            self.assertEqual(self.app.nch, 8)
+            await pilot.press("y")
+            await self.settle(pilot, lambda: not self.app.modules)
+            self.assertIsNone(self.app.dev)
+            self.assertFalse(self.app._rows_built)
+            self.assertIn("not connected", self.screen_text())
             self.assertEqual(
-                self.app.query_one("#chans", DataTable).row_count, 8)
+                self.app.query_one("#chans", DataTable).row_count, 0)
             self.app.exit()
 
 
@@ -549,22 +758,21 @@ class SelectingChannels(PanelTest):
                              .startswith("77.5"))
             self.app.exit()
 
-    async def test_switching_modules_forgets_the_selection(self):
+    async def test_a_module_arrives_with_nothing_selected(self):
         async with self.app.run_test() as pilot:
-            worker = await self.connected(pilot)
+            await self.connected(pilot)
             await pilot.press("a")
             await pilot.pause()
+            self.assertEqual(self.app.selected, set(range(8)))
             await pilot.press("m")
             await pilot.pause()
-            await pilot.press("y")                   # yes, disconnect is fine
-            await pilot.pause()
-            # The picker can still be cancelled, and that keeps the link --
-            # so it has to keep the selection too.
+            # The picker can still be cancelled, and that changes nothing --
+            # so the selection has to survive it.
             self.assertEqual(self.app.selected, set(range(8)))
-            self.app.screen.query_one("#profiles", DataTable).move_cursor(row=2)
-            await pilot.press("enter")
-            await self.settle(pilot, lambda: self.app.worker is not worker
-                              and self.app._rows_built)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(self.app.selected, set(range(8)))
+            await self.second(pilot)
             self.assertEqual(self.app.selected, set())
             self.app.exit()
 
@@ -623,12 +831,38 @@ class TheLog(PanelTest):
             self.assertIn("CH1 VSET = 42.0", self.log_text())
             self.app.exit()
 
+    async def test_lines_say_which_module_they_came_from(self):
+        """One log for the whole session, so with several supplies open every
+        line has to name the one it is about.  The log outlives the tab that
+        was in front at the time, and "CH0 VSET = 42.0" against no named
+        supply is not a record of anything."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.second(pilot)
+            self.app.query_one("#chans", DataTable).focus()
+            await pilot.press("right", "enter")           # CH0 VSet
+            await pilot.pause()
+            self.app.screen.query_one("#value", Input).value = "42.0"
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: self.app.values[0]
+                              .get("VSET", "").startswith("42"))
+            self.assertIn("Bench sim ✓ CH0 VSET = 42.0", self.log_text())
+            self.app.exit()
+
+    async def test_one_module_is_not_labelled(self):
+        """Naming the only supply there is would be noise on every line."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("s")
+            await pilot.pause()
+            self.assertIn("selected 0", self.log_text())
+            self.assertNotIn("Simulator selected", self.log_text())
+            self.app.exit()
+
     async def test_profile_edits_reach_the_panel_log(self):
         async with self.app.run_test() as pilot:
             await self.connected(pilot)
             await pilot.press("m")                    # back to the picker
-            await pilot.pause()
-            await pilot.press("y")                    # yes, the sim is live
             await pilot.pause()
             self.app.screen.query_one("#profiles", DataTable).move_cursor(row=0)
             await pilot.press("d")                    # delete Lab rack A
@@ -931,25 +1165,22 @@ class NamingChannels(PanelTest):
             self.assertNotIn(99, self.app.named)
             self.app.exit()
 
-    async def test_reconnecting_takes_the_new_modules_names(self):
-        """Another module's channels are not these, and neither are its
-        names: they come from the profile at connect, not from the session."""
+    async def test_each_module_shows_only_its_own_names(self):
+        """Another module's channels are not these, and neither are its names:
+        they come from that module's profile, not from the session."""
         SIM_PROFILE.labels = {1: "Endcap A"}
         self.addCleanup(SIM_PROFILE.labels.clear)
         async with self.app.run_test() as pilot:
-            worker = await self.connected(pilot)
+            await self.connected(pilot)
             self.assertEqual(self.app.labels, {1: "Endcap A"})
-            SIM_PROFILE.labels = {}
-            await pilot.press("m")
-            await pilot.pause()
-            await pilot.press("y")                   # yes, the sim is live
-            await pilot.pause()
-            self.app.screen.query_one("#profiles", DataTable).move_cursor(row=2)
-            await pilot.press("enter")
-            await self.settle(pilot, lambda: self.app.worker is not worker
-                              and self.app._rows_built)
+            self.assertIn("NAME", self.column_keys())
+            await self.second(pilot)
             self.assertEqual(self.app.labels, {})
             self.assertNotIn("NAME", self.column_keys())
+            await pilot.press("1")
+            await pilot.pause()
+            self.assertEqual(self.app.labels, {1: "Endcap A"})
+            self.assertIn("NAME", self.column_keys())
             self.app.exit()
 
     async def test_a_name_is_refused_before_it_is_saved(self):

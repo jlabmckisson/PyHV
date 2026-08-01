@@ -129,6 +129,48 @@ class ChannelTable(DataTable):
         self.app.fit_columns()
 
 
+# The marker each tab carries, so a module in a background tab can still say
+# what it is doing.  A tab is a glance, not a diagnosis: the point of `!` is to
+# get somebody to press the key and look, not to say what went wrong.
+TAB_ALARM = "!"
+TAB_LIVE = "●"
+TAB_OFF = "○"
+TAB_WAIT = "…"          # connected, nothing read back yet
+TAB_PAUSED = "‖"        # its poll loop is stopped, so its reading is stale
+
+# Said on the bar rather than only in the help: the tabs are the one part of
+# the panel with no key of its own in the footer, which has no room left.
+TAB_HINT = " [ ] switches, w closes"
+HINT_WIDTH = len(TAB_HINT)
+# What a tab costs besides its name: " 3 " + " " + marker + "  ".
+TAB_FURNITURE = 7
+
+
+class ModuleTabs(Static):
+    """The row of connected modules, one line high.
+
+    A single Static rather than a widget per module: the bar is repainted on
+    every reading, and which tab a click landed in is a matter of which span
+    the x falls in -- which is known from the painting anyway.  A widget each
+    would mean mounting and unmounting on every connect.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(id="tabs")
+        self.spans: list[tuple[int, int]] = []
+
+    def on_click(self, event) -> None:
+        for i, (start, end) in enumerate(self.spans):
+            if start <= event.x < end:
+                self.app.show_module(i)
+                return
+
+    def on_resize(self) -> None:
+        # How much of each name fits depends on the width, and a paused panel
+        # has no poll coming to redraw the bar.
+        self.app._paint_tabs()
+
+
 # --------------------------------------------------------------------------
 # Device thread
 # --------------------------------------------------------------------------
@@ -141,19 +183,91 @@ class Sample:
     error: str | None = None
 
 
+@dataclass
+class Module:
+    """One connected supply: its link, its I/O thread, and what was read back.
+
+    Every field here used to sit on the App, because there was only ever one
+    module.  A panel holding several needs one of each per module, and needs
+    them to keep filling in while the operator is looking at a different tab:
+    a trip on the supply nobody is watching is the one worth catching.
+
+    Only the active module's state is on screen.  Everything else here is a
+    tab away, which is why `cursor` and `selected` live with the module rather
+    than with the table -- coming back to a tab should find it as it was left.
+    """
+
+    dev: Device
+    profile: Profile | None
+    interval: float
+    worker: "DeviceWorker | None" = None
+    nch: int = 0
+    # What this particular module can supply, resolved once on connect.
+    columns: list[Column] = field(default_factory=list)
+    info: dict[str, ParamInfo] = field(default_factory=dict)
+    board: dict[str, str] = field(default_factory=dict)
+    flags: list[list[str]] = field(default_factory=list)
+    values: list[dict[str, str]] = field(default_factory=list)
+    selected: set[int] = field(default_factory=set)
+    labels: dict[int, str] = field(default_factory=dict)
+    ready: bool = False          # its columns are known, so a table can be built
+    last_error: str | None = None
+    stamp: float = 0.0           # when the last reading landed
+    cursor: Coordinate = Coordinate(0, 0)
+
+    @property
+    def name(self) -> str:
+        """What the tab bar and the log call it."""
+        return self.profile.name if self.profile else self.dev.t.describe()
+
+    @property
+    def paused(self) -> bool:
+        return self.worker.paused if self.worker else False
+
+    @property
+    def live(self) -> list[int]:
+        """Channels reporting ON.  Empty also means "nothing read yet"."""
+        return [c for c in range(self.nch) if c < len(self.flags)
+                and "ON" in self.flags[c]]
+
+    @property
+    def known(self) -> bool:
+        """Whether any channel has been read.  Silence is not "all off"."""
+        return any(self.values)
+
+    @property
+    def alarmed(self) -> bool:
+        """Anything the operator would want to be told about from another tab.
+
+        Deliberately broad: a tab is a glance, not a diagnosis, and the cost of
+        looking at a module that turns out to be fine is one keypress.
+        """
+        if self.last_error:
+            return True
+        if self.board.get("BDILK", "").upper() == "YES":
+            return True
+        if self.board.get("BDALARM", "0") not in ("0", ""):
+            return True
+        return any(set(f) & ALARM_FLAGS for f in self.flags)
+
+
 class DeviceWorker(threading.Thread):
     """Owns the Device.  Nothing else may touch it.
+
+    One per connected module, each polling on its own interval -- a module in
+    a background tab is still read, so its tab can say when something has gone
+    wrong on it.
 
     Queued commands always run before the next poll and force an immediate
     re-read afterwards, so an edit shows its effect without waiting out the
     poll interval.
     """
 
-    def __init__(self, dev: Device, app: "HVApp", interval: float):
+    def __init__(self, mod: Module, app: "HVApp"):
         super().__init__(daemon=True, name="hv-io")
-        self.dev = dev
+        self.mod = mod
+        self.dev = mod.dev
         self.app = app
-        self.interval = interval
         self.paused = False
         self._q: queue.Queue = queue.Queue()
         self._wake = threading.Event()
@@ -200,7 +314,7 @@ class DeviceWorker(threading.Thread):
             now = time.monotonic()
             if not self.paused and now >= self._due:
                 self._poll()
-                self._due = time.monotonic() + self.interval
+                self._due = time.monotonic() + self.mod.interval
             timeout = 0.25 if self.paused else max(0.02, self._due - time.monotonic())
             self._wake.wait(timeout)
             self._wake.clear()
@@ -216,9 +330,9 @@ class DeviceWorker(threading.Thread):
 
     def _dispatch(self, fn, a) -> None:
         """Runs on the UI thread.  A superseded worker's late reading -- one
-        already in flight when the user switched modules -- is dropped rather
-        than painted over the new module's channels."""
-        if self._stop.is_set() or self.app.worker is not self:
+        already in flight when the tab it belongs to was closed -- is dropped
+        rather than painted over some other module's channels."""
+        if self._stop.is_set() or self.mod.worker is not self:
             return
         try:
             fn(*a)
@@ -237,8 +351,8 @@ class DeviceWorker(threading.Thread):
                 self._board[p] = self.dev.mon_bd(p)
             except HVError:
                 self._board[p] = ""
-        self._to_app(self.app.on_device_ready, nch, list(self.columns), infos,
-                     dict(self._board), missing)
+        self._to_app(self.app.on_device_ready, self.mod, nch,
+                     list(self.columns), infos, dict(self._board), missing)
 
     def _resolve(self) -> list[str]:
         """Match what we want to display against what the module has.
@@ -279,12 +393,13 @@ class DeviceWorker(threading.Thread):
             try:
                 fn(self.dev)
             except HVError as e:
-                self._to_app(self.app.on_command_result, label, str(e))
+                self._to_app(self.app.on_command_result, self.mod, label,
+                             str(e))
             except OSError as e:
-                self._to_app(self.app.on_command_result, label,
+                self._to_app(self.app.on_command_result, self.mod, label,
                              f"link error: {e}")
             else:
-                self._to_app(self.app.on_command_result, label, None)
+                self._to_app(self.app.on_command_result, self.mod, label, None)
             self._cycle = 0     # a write may have moved a slow parameter
             self._due = 0.0
 
@@ -340,10 +455,10 @@ class DeviceWorker(threading.Thread):
         for name in gone:
             self._values.pop(name, None)
             self._board.pop(name, None)
-        self._to_app(self.app.on_params_dropped, sorted(gone))
+        self._to_app(self.app.on_params_dropped, self.mod, sorted(gone))
 
     def _emit(self, sample: Sample) -> None:
-        self._to_app(self.app.on_sample, sample)
+        self._to_app(self.app.on_sample, self.mod, sample)
 
 
 # --------------------------------------------------------------------------
@@ -811,11 +926,15 @@ class ProfileEditScreen(ArrowFocus, ModalScreen["Profile | None"]):
 
 
 class ConnectScreen(ModalScreen["Profile | None"]):
-    """Pick the module to talk to, or edit the list of them.
+    """Pick a module to talk to, or edit the list of them.
 
     Dismissing with a profile means "connect to this"; with None it means
-    "carry on with whatever link I already have", which for a session that
+    "carry on with whatever links I already have", which for a session that
     has none is the same as quitting.
+
+    A profile already open in a tab is marked as such: connecting to it a
+    second time would double that module's poll traffic and give two tabs that
+    disagree, so the panel goes to the open one instead.
     """
 
     BINDINGS = [
@@ -832,11 +951,13 @@ class ConnectScreen(ModalScreen["Profile | None"]):
     ]
 
     def __init__(self, store: ProfileStore, current: str = "",
-                 can_cancel: bool = False):
+                 can_cancel: bool = False,
+                 open_names: list[str] | None = None):
         super().__init__()
         self.store = store
         self.current = current
         self.can_cancel = can_cancel
+        self.open_names = {n.casefold() for n in (open_names or [])}
         self.rows: list[Profile] = []
 
     def compose(self) -> ComposeResult:
@@ -872,10 +993,13 @@ class ConnectScreen(ModalScreen["Profile | None"]):
         table.clear()
         self.rows = list(self.store.profiles) + [SIM_PROFILE]
         for p in self.rows:
-            note = "last used" if p.name == self.store.last_used else ""
+            # "open" first: which tab a name is already in decides what enter
+            # will do to it, and that matters more than which was last used.
+            open_here = p.name.casefold() in self.open_names
+            note = Text("open", "cyan") if open_here else Text(
+                "last used" if p.name == self.store.last_used else "", "dim")
             table.add_row(Text(p.name, "bold" if not p.is_sim else "dim"),
-                          Text(p.address, "" if not p.is_sim else "dim"),
-                          Text(note, "dim"))
+                          Text(p.address, "" if not p.is_sim else "dim"), note)
         for i, p in enumerate(self.rows):
             if select and p.name.casefold() == select.casefold():
                 table.move_cursor(row=i)
@@ -987,7 +1111,8 @@ class ConnectScreen(ModalScreen["Profile | None"]):
 # front of a live supply, so it shows `?` and `esc`, not `question_mark`.
 KEY_NAMES = {"question_mark": "?", "escape": "esc", "equals_sign": "=",
              "plus": "+", "minus": "-", "up": "↑", "down": "↓", "left": "←",
-             "right": "→", "enter": "enter", "space": "space"}
+             "right": "→", "enter": "enter", "space": "space",
+             "left_square_bracket": "[", "right_square_bracket": "]"}
 
 
 @dataclass(frozen=True)
@@ -1001,10 +1126,13 @@ class HelpKey:
     """
     keys: tuple[str, ...]
     text: str
+    # For a run of keys that all do the same kind of thing.  The nine digits
+    # spelled out fill the key column twice over and say nothing `1…9` does not.
+    show_as: str = ""
 
     @property
     def pretty(self) -> str:
-        return " ".join(KEY_NAMES.get(k, k) for k in self.keys)
+        return self.show_as or " ".join(KEY_NAMES.get(k, k) for k in self.keys)
 
 
 HELP_SECTIONS: list[tuple[str, list[HelpKey]]] = [
@@ -1038,23 +1166,40 @@ HELP_SECTIONS: list[tuple[str, list[HelpKey]]] = [
     ("High voltage", [
         HelpKey(("space",), "switch the channel under the cursor on or off"),
         HelpKey(("o", "f"), "on, off — when a toggle is not what you want"),
-        HelpKey(("X",), "ALL OFF: every channel on the module"),
+        HelpKey(("X",), "ALL OFF: every live channel on the module in front "
+                        "of you.  Modules in other tabs are not touched"),
         HelpKey(("c",), "clear the board alarm and latched trips"),
         HelpKey((), "Every one of these asks first.  All of them need the "
                     "module in REMOTE; in LOCAL the front panel has it and "
                     "each SET comes back refused."),
     ]),
+    ("Modules", [
+        HelpKey(("m",), "connect another module — it opens in a new tab, and "
+                        "nothing already connected is disturbed"),
+        HelpKey(("right_square_bracket", "left_square_bracket"),
+                "next tab, previous tab"),
+        HelpKey(tuple("123456789"), "go straight to that tab, by the number "
+                                    "the bar shows", show_as="1…9"),
+        HelpKey(("w",),
+                "close this tab.  It asks first if any channel is live: the "
+                "module keeps its output after the panel stops watching it"),
+        HelpKey((), "Every tab keeps polling, so the marker beside its name "
+                    "stays true: ● live, ○ all off, ! something to look at, "
+                    "‖ paused, … nothing read yet.  Everything else on this "
+                    "list — every key, the log, the selection — acts on the "
+                    "tab in front of you and no other."),
+    ]),
     ("Session", [
         HelpKey(("r",), "read everything now, without waiting for the poll"),
-        HelpKey(("p",), "pause polling, or resume it"),
+        HelpKey(("p",), "pause polling on this module, or resume it"),
         HelpKey(("plus", "equals_sign", "minus"),
                 "poll slower, faster.  The period doubles and halves between "
-                "0.25s and 30s; = is + without the shift"),
-        HelpKey(("m",), "switch to another module"),
+                "0.25s and 30s; = is + without the shift.  Each module keeps "
+                "its own rate"),
         HelpKey(("question_mark", "f1"), "this help"),
         HelpKey(("q",),
                 "quit.  Channels are left exactly as they are — quitting the "
-                "panel does not switch anything off"),
+                "panel does not switch anything off, on any module"),
     ]),
 ]
 
@@ -1205,6 +1350,14 @@ class HVApp(App):
     TITLE = "hvctl"
 
     CSS = """
+    /* One line, and only there once something is connected: on a 24-row
+       terminal the header, board line, log and footer already cost ten. */
+    #tabs {
+        height: 1;
+        padding: 0 1;
+        background: $panel-darken-1;
+    }
+    #tabs.gone { display: none; }
     #board {
         height: auto;
         padding: 0 1;
@@ -1278,46 +1431,144 @@ class HVApp(App):
         Binding("c", "clear_alarm", "Clear alarm"),
         Binding("r", "refresh", "Refresh"),
         Binding("p", "pause", "Pause"),
-        Binding("m", "switch_module", "Module…"),
+        Binding("m", "add_module", "Connect…"),
+        # Tabs.  Unshifted and off the arrow keys, which the table has.
+        Binding("right_square_bracket", "next_module", "Next module",
+                show=False),
+        Binding("left_square_bracket", "prev_module", "Previous module",
+                show=False),
+        Binding("w", "close_module", "Close module", show=False),
         Binding("plus,equals_sign", "slower", "Slower", show=False),
         Binding("minus", "faster", "Faster", show=False),
         Binding("question_mark,f1", "help", "Help"),
         Binding("q", "quit", "Quit"),
+    ] + [
+        # One binding per digit rather than a key handler: the help screen is
+        # checked against BINDINGS, and a key that is not declared here is a
+        # key nothing makes sure is documented.
+        Binding(str(n), f"goto_module({n})", f"Module {n}", show=False)
+        for n in range(1, 10)
     ]
 
     def __init__(self, dev: Device | None = None, interval: float = 1.0,
                  read_only: bool = False, store: ProfileStore | None = None,
                  timeout: float = 3.0, verbose: bool = False):
         super().__init__()
-        self.dev = dev
-        self.interval = interval
+        # Every module the panel is holding, in tab order, and which one is on
+        # screen.  All of them keep polling; only the active one is painted.
+        self.modules: list[Module] = []
+        self.active_index = -1
+        self._first_dev = dev           # a link named on the command line
+        self.default_interval = interval
         self.read_only = read_only
         self.store = store if store is not None else ProfileStore()
         self.timeout = timeout
         self.verbose = verbose
-        self.profile: Profile | None = None
-        self.nch = 0
-        # Which columns this module can actually supply; known only once the
-        # worker has asked it, so the table is built then rather than at mount.
-        self.columns: list[Column] = []
-        self.info: dict[str, ParamInfo] = {}
-        self.board: dict[str, str] = {}
-        self.flags: list[list[str]] = []
-        self.values: list[dict[str, str]] = []
-        # Channels an edit applies to.  Empty means "the one under the cursor",
-        # which is how the panel behaved before there was a selection at all.
-        self.selected: set[int] = set()
-        # Channel number -> name, loaded from the profile on connect.  Ours,
-        # not the module's: the protocol has nowhere to keep such a thing.
-        self.labels: dict[int, str] = {}
-        self.worker: DeviceWorker | None = None
-        self._rows_built = False
-        self._last_error: str | None = None
+
+    # -- the module on screen ----------------------------------------------
+    # Everything below used to be an attribute of the App, back when there was
+    # only ever one module.  They stay spelled the same way -- the panel is
+    # written throughout in terms of "the module in front of me" -- but they
+    # now read through to whichever tab is active.
+
+    @property
+    def active(self) -> Module | None:
+        if 0 <= self.active_index < len(self.modules):
+            return self.modules[self.active_index]
+        return None
+
+    @property
+    def dev(self) -> Device | None:
+        return self.active.dev if self.active else None
+
+    @property
+    def worker(self) -> DeviceWorker | None:
+        return self.active.worker if self.active else None
+
+    @property
+    def nch(self) -> int:
+        return self.active.nch if self.active else 0
+
+    @property
+    def columns(self) -> list[Column]:
+        return self.active.columns if self.active else []
+
+    @property
+    def info(self) -> dict[str, ParamInfo]:
+        return self.active.info if self.active else {}
+
+    @property
+    def board(self) -> dict[str, str]:
+        return self.active.board if self.active else {}
+
+    @property
+    def flags(self) -> list[list[str]]:
+        return self.active.flags if self.active else []
+
+    @flags.setter
+    def flags(self, value: list[list[str]]) -> None:
+        if self.active:
+            self.active.flags = value
+
+    @property
+    def values(self) -> list[dict[str, str]]:
+        return self.active.values if self.active else []
+
+    @values.setter
+    def values(self, value: list[dict[str, str]]) -> None:
+        if self.active:
+            self.active.values = value
+
+    @property
+    def selected(self) -> set[int]:
+        """Channels an edit applies to.  Empty means "the one under the
+        cursor", which is how the panel behaved before it had a selection."""
+        return self.active.selected if self.active else set()
+
+    @selected.setter
+    def selected(self, value: set[int]) -> None:
+        if self.active:
+            self.active.selected = set(value)
+
+    @property
+    def labels(self) -> dict[int, str]:
+        """Channel number -> name, from the profile.  Ours, not the module's:
+        the protocol has nowhere to keep such a thing."""
+        return self.active.labels if self.active else {}
+
+    @labels.setter
+    def labels(self, value: dict[int, str]) -> None:
+        if self.active:
+            self.active.labels = dict(value)
+
+    @property
+    def profile(self) -> Profile | None:
+        return self.active.profile if self.active else None
+
+    @profile.setter
+    def profile(self, value: Profile | None) -> None:
+        if self.active:
+            self.active.profile = value
+
+    @property
+    def interval(self) -> float:
+        """The active module's poll rate.  Each keeps its own -- a module on a
+        9600 baud serial link cannot be read as often as one on Ethernet."""
+        return self.active.interval if self.active else self.default_interval
+
+    @property
+    def _rows_built(self) -> bool:
+        return self.active.ready if self.active else False
+
+    @property
+    def _last_error(self) -> str | None:
+        return self.active.last_error if self.active else None
 
     # -- layout ------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield ModuleTabs()
         yield Static("connecting…", id="board")
         yield ChannelTable(id="chans", cursor_type="cell",
                            zebra_stripes=True)
@@ -1327,102 +1578,197 @@ class HVApp(App):
     def on_mount(self) -> None:
         if self.read_only:
             self.log_line("[yellow]read-only mode: SET is disabled[/yellow]")
-        if self.dev is not None:
-            self._attach(self.dev, None)    # a link was named on the command line
+        self._paint_tabs()
+        if self._first_dev is not None:
+            self._attach(self._first_dev, None)   # named on the command line
         else:
             self.query_one("#board", Static).update(
                 Text("not connected", "dim"))
             self.choose_module()
 
     def on_unmount(self) -> None:
-        self._detach()
+        for mod in list(self.modules):
+            self._detach(mod)
 
     # -- connection --------------------------------------------------------
 
-    def _attach(self, dev: Device, profile: Profile | None) -> None:
-        self.dev = dev
-        self.profile = profile
-        self.labels = dict(profile.labels) if profile else {}
-        self.sub_title = (f"{profile.name} — {dev.t.describe()}" if profile
-                          else dev.t.describe())
-        self.log_line(f"[dim]link {dev.t.describe()}[/dim]")
-        self.worker = DeviceWorker(dev, self, self.interval)
-        self.worker.start()
+    def _attach(self, dev: Device, profile: Profile | None) -> Module:
+        """Add a module and put it on screen.  Its poll loop starts here."""
+        mod = Module(dev=dev, profile=profile, interval=self.default_interval,
+                     labels=dict(profile.labels) if profile else {})
+        self.modules.append(mod)
+        mod.worker = DeviceWorker(mod, self)
+        self.log_line(f"[dim]link {dev.t.describe()}[/dim]", mod)
+        # On screen before the poll loop starts: `on_device_ready` builds the
+        # table only for the active module, and a fast link can deliver it
+        # before the next statement would have run.
+        self.show_module(len(self.modules) - 1)
+        mod.worker.start()
+        return mod
 
-    def _detach(self) -> None:
-        """Drop the current link and empty the display of its readings.
+    def _detach(self, mod: Module) -> None:
+        """Stop a module's poll loop and drop its link.
 
         The I/O thread is not joined: it may be blocked in `call_from_thread`
         waiting on this very event loop, and a late result it delivers is
-        discarded by DeviceWorker._dispatch anyway.
+        discarded by `DeviceWorker._dispatch` -- which is why the worker is
+        cleared off the module first.
         """
-        if self.worker:
-            self.worker.stop()
-            self.worker = None
-        if self.dev:
-            self.dev.t.close()
-            self.dev = None
-        self.profile = None
-        self.nch = 0
-        self.columns = []
-        self.info, self.board = {}, {}
-        self.flags, self.values = [], []
-        self.selected.clear()       # another module's channels are not these
-        self.labels = {}            # and neither are its names
-        self._rows_built = False
-        self._last_error = None
+        if mod.worker:
+            mod.worker.stop()
+            mod.worker = None
+        mod.dev.t.close()
+
+    def _forget(self, mod: Module) -> None:
+        """Close a module's tab, leaving the panel on whatever is next."""
+        self._detach(mod)
+        at = self.modules.index(mod)
+        keep = None if mod is self.active else self.active
+        self.modules.remove(mod)
+        # Nothing is active while the list is being rearranged: `show_module`
+        # saves the outgoing module's cursor, and the index it would read is
+        # about to mean a different module or none at all.
+        self.active_index = -1
+        if not self.modules:
+            self._show_nothing()
+        elif keep is not None:
+            # A tab closed from under another one: the rest shift left.
+            self.show_module(self.modules.index(keep))
+        else:
+            self.show_module(min(at, len(self.modules) - 1))
+
+    def _show_nothing(self) -> None:
+        self.sub_title = ""
         if self.is_running:
-            # Columns go too: the next module may not have the same ones.
             self.query_one("#chans", DataTable).clear(columns=True)
             self.query_one("#board", Static).update(
                 Text("not connected — press m to choose a module, ? for help",
                      "dim"))
+            self._paint_tabs()
+
+    def find_module(self, name: str) -> Module | None:
+        """The open tab for a profile, if it is already on screen."""
+        return next((m for m in self.modules if m.profile is not None
+                     and m.profile.name.casefold() == name.casefold()), None)
 
     @work
     async def choose_module(self) -> None:
-        """Ask for a profile, connect, and keep asking until one works."""
+        """Ask for a profile, connect it as a new tab, and keep asking until
+        one works.  Cancelling leaves whatever is already open alone."""
         while True:
             prof = await self.push_screen_wait(ConnectScreen(
                 self.store, current=self.profile.name if self.profile else "",
-                can_cancel=self.dev is not None))
+                can_cancel=bool(self.modules),
+                open_names=[m.name for m in self.modules]))
             if prof is None:
-                if self.dev is None:
+                if not self.modules:
                     self.exit()
+                return
+            # Dialling the same supply twice would double its poll traffic and
+            # give two tabs that disagree with each other.  Go to it instead.
+            already = self.find_module(prof.name)
+            if already is not None:
+                self.show_module(self.modules.index(already))
+                self.log_line(f"[cyan]{escape(prof.name)} is already open"
+                              f"[/cyan]")
                 return
             if await self._connect(prof):
                 return
 
     async def _connect(self, prof: Profile) -> bool:
-        self.log_line(f"[dim]connecting to {prof.name} ({prof.address})…[/dim]")
+        self.log_line(f"[dim]connecting to {escape(prof.name)} "
+                      f"({prof.address})…[/dim]")
         try:
             # Blocking connect, so off the UI thread it goes.
             dev = await asyncio.to_thread(device_for_profile, prof,
                                           self.timeout, self.verbose)
         except (OSError, HVError) as e:
-            self.log_line(f"[red]{prof.name}: {e}[/red]")
-            self.notify(str(e), title=f"cannot reach {prof.name}",
+            self.log_line(f"[red]{escape(prof.name)}: {e}[/red]")
+            self.notify(str(e), title=f"cannot reach {escape(prof.name)}",
                         severity="error", timeout=8)
             return False
-        self._detach()
         self._attach(dev, prof)
-        self.log_line(f"[green]connected to {prof.name}[/green]")
+        self.log_line(f"[green]connected to {escape(prof.name)}[/green]")
         if not prof.is_sim:
             self.store.remember(prof.name)
         return True
 
+    def action_add_module(self) -> None:
+        """`m` opens the picker.  Connecting adds a tab rather than replacing
+        the current link -- nothing here disconnects anything, so there is
+        nothing to warn about."""
+        self.choose_module()
+
+    # -- tabs --------------------------------------------------------------
+
+    def show_module(self, index: int) -> None:
+        """Put a module on screen, keeping the one leaving as it was.
+
+        The table is rebuilt rather than swapped for a second one: a different
+        module has different columns, and `_build_table` already does exactly
+        this job when the Name column comes and goes.
+        """
+        if not 0 <= index < len(self.modules):
+            return
+        if self.active is not None and index != self.active_index:
+            self._remember_cursor()
+        self.active_index = index
+        mod = self.modules[index]
+        self.sub_title = (f"{mod.profile.name} — {mod.dev.t.describe()}"
+                          if mod.profile else mod.dev.t.describe())
+        if mod.ready:
+            self._build_table(mod.cursor)
+        else:
+            # Still resolving its parameters; `on_device_ready` builds it.
+            self.query_one("#chans", DataTable).clear(columns=True)
+        self._paint_board(mod.stamp or time.time())
+        self._paint_tabs()
+
+    def _remember_cursor(self) -> None:
+        """Keep where the cursor was, so coming back to a tab finds it there."""
+        try:
+            table = self.query_one("#chans", DataTable)
+        except NoMatches:
+            return
+        if self.active is not None and self.active.ready:
+            self.active.cursor = table.cursor_coordinate
+
+    def action_next_module(self) -> None:
+        if len(self.modules) > 1:
+            self.show_module((self.active_index + 1) % len(self.modules))
+
+    def action_prev_module(self) -> None:
+        if len(self.modules) > 1:
+            self.show_module((self.active_index - 1) % len(self.modules))
+
+    def action_goto_module(self, n: int) -> None:
+        """`1`..`9` -- the numbers the tab bar shows."""
+        if n <= len(self.modules):
+            self.show_module(n - 1)
+
     @work
-    async def action_switch_module(self) -> None:
-        live = [c for c in range(self.nch) if "ON" in self.flags[c]]
-        # An empty `flags` is how the panel looks both when every channel is
-        # off and when nothing has been read yet -- `on_device_ready` clears it
-        # and the first poll fills it.  Silence from a module that may well
-        # have its outputs up is not the same answer as "nothing is on", so
-        # the unknown asks too, and says which of the two it is asking about.
-        known = any(self.values)
-        if live or not known:
+    async def action_close_module(self) -> None:
+        """Close this tab.  The module keeps doing whatever it was doing.
+
+        This is where the old `m` warning went: switching tabs disconnects
+        nothing, but closing one does, and a supply that is still energised
+        after the panel stops watching it is worth a sentence.
+        """
+        mod = self.active
+        if mod is None:
+            return
+        live = mod.live
+        # Profile names are not checked for console markup the way channel
+        # names are, and a dialog renders it.
+        where = escape(mod.name)
+        # An empty `flags` is how a module looks both when every channel is off
+        # and when nothing has been read yet.  Silence from a supply that may
+        # well have its outputs up is not the same answer as "nothing is on",
+        # so the unknown asks too, and says which of the two it is asking.
+        if live or not mod.known:
             ok = await self.push_screen_wait(ConfirmScreen(
-                "Disconnect with channels live?" if live else
-                "Disconnect before the first reading?",
+                f"Close {where} with channels live?" if live else
+                f"Close {where} before the first reading?",
                 f"{', '.join(self.ch_label(c) for c in live)} stay energised — "
                 "the module keeps its output when nothing is watching it."
                 if live
@@ -1432,75 +1778,148 @@ class HVApp(App):
                 danger=True, default_yes=False))
             if not ok:
                 return
-        self.choose_module()
+            if mod not in self.modules:
+                return          # closed from elsewhere while the dialog was up
+        self.log_line(f"[cyan]closed {escape(mod.name)}[/cyan]")
+        self._forget(mod)
+
+    def _paint_tabs(self) -> None:
+        """Redraw the tab bar, and record where each tab starts for clicks."""
+        try:
+            bar = self.query_one(ModuleTabs)
+        except NoMatches:
+            return
+        bar.set_class(not self.modules, "gone")
+        if not self.modules:
+            bar.spans = []
+            return
+        # A tab that has been scrolled off the edge is a module the operator
+        # cannot see the state of, so names are shortened to keep every tab on
+        # the line rather than letting the last ones fall off it.
+        width = bar.content_size.width or max(20, self.size.width - 2)
+        room = width - HINT_WIDTH if len(self.modules) > 1 else width
+        cap = max(4, room // len(self.modules) - TAB_FURNITURE)
+
+        line, spans = Text(), []
+        for i, mod in enumerate(self.modules):
+            start = len(line.plain)
+            active = i == self.active_index
+            line.append(f" {i + 1} ", "bold" if active else "dim")
+            name = mod.name
+            line.append(name if len(name) <= cap else name[:cap - 1] + "…",
+                        "bold reverse" if active else "")
+            line.append(" ")
+            line.append_text(self._tab_mark(mod))
+            line.append("  ")
+            spans.append((start, len(line.plain)))
+        if len(self.modules) > 1 and len(line.plain) + HINT_WIDTH <= width:
+            line.append(TAB_HINT, "dim")
+        bar.spans = spans
+        bar.update(line)
+
+    @staticmethod
+    def _tab_mark(mod: Module) -> Text:
+        if mod.alarmed:
+            mark = Text(TAB_ALARM, "bold red")
+        elif not mod.ready or not mod.known:
+            mark = Text(TAB_WAIT, "dim")
+        elif mod.live:
+            mark = Text(TAB_LIVE, "bold green")
+        else:
+            mark = Text(TAB_OFF, "dim")
+        if mod.paused:
+            mark.append(TAB_PAUSED, "yellow")
+        return mark
 
     # -- callbacks from the I/O thread -------------------------------------
 
-    def on_device_ready(self, nch: int, columns: list[Column],
+    def on_device_ready(self, mod: Module, nch: int, columns: list[Column],
                         infos: dict[str, ParamInfo], board: dict[str, str],
                         missing: list[str]) -> None:
-        self.nch = nch
-        self.columns = columns
-        self.info = infos
-        self.board.update(board)
-        self.flags = [[] for _ in range(nch)]
-        self.values = [{} for _ in range(nch)]
-        self.selected.clear()
-        self._build_table()
+        mod.nch = nch
+        mod.columns = columns
+        mod.info = infos
+        mod.board.update(board)
+        mod.flags = [[] for _ in range(nch)]
+        mod.values = [{} for _ in range(nch)]
+        mod.selected.clear()
+        mod.ready = True
+        if mod is self.active:
+            self._build_table()
         name = board.get("BDNAME", "?")
         self.log_line(f"[green]{name}[/green]  sn {board.get('BDSNUM', '?')}"
-                      f"  fw {board.get('BDFREL', '?')}  {nch} channels")
+                      f"  fw {board.get('BDFREL', '?')}  {nch} channels", mod)
         if missing:
             self.log_line(f"[dim]not offered by this module: "
-                          f"{', '.join(missing)}[/dim]")
+                          f"{', '.join(missing)}[/dim]", mod)
         if board.get("BDCTR", "").upper() != "REMOTE":
             self.log_line("[bold yellow]module is in LOCAL mode — it will "
                           "refuse every write until the front panel is set to "
-                          "REMOTE[/bold yellow]")
+                          "REMOTE[/bold yellow]", mod)
+        self._paint_tabs()
 
-    def on_sample(self, sample: Sample) -> None:
+    def on_sample(self, mod: Module, sample: Sample) -> None:
+        """A reading, from any tab.  Only the active one is painted; the rest
+        is kept so switching to a tab shows what that module is doing now."""
         if sample.error:
-            self.query_one("#board", Static).update(
-                Text(f"link error: {sample.error}", "bold white on red"))
+            if mod is self.active:
+                self.query_one("#board", Static).update(
+                    Text(f"link error: {sample.error}", "bold white on red"))
             # A dead link repeats the same error every poll; log the change,
             # not the repetition.
-            if sample.error != self._last_error:
-                self.log_line(f"[red]{sample.error}[/red]")
-                self._last_error = sample.error
+            if sample.error != mod.last_error:
+                self.log_line(f"[red]{sample.error}[/red]", mod)
+                mod.last_error = sample.error
+                self._paint_tabs()
             return
-        if self._last_error:
-            self.log_line("[green]link recovered[/green]")
-            self._last_error = None
-        self.board.update(sample.board)
-        if self._rows_built:
-            self._paint(sample)
-        self._paint_board(sample.stamp)
+        if mod.last_error:
+            self.log_line("[green]link recovered[/green]", mod)
+            mod.last_error = None
+        mod.board.update(sample.board)
+        mod.stamp = sample.stamp
+        for c, row in enumerate(sample.channels):
+            if c >= mod.nch:
+                break
+            _, mod.flags[c] = decode_status(row.get("STATUS", "0"))
+            mod.values[c] = row
+        if mod is self.active:
+            if mod.ready:
+                self._paint(sample)
+            self._paint_board(sample.stamp)
+        self._paint_tabs()
 
-    def on_params_dropped(self, names: list[str]) -> None:
+    def on_params_dropped(self, mod: Module, names: list[str]) -> None:
         """The module rejected a parameter it had advertised (or never listed).
 
         It will not be asked for again, so this is said once rather than once
         a second, and the column goes with it -- a header over permanently
         blank cells reads as a broken link, which it is not.
         """
-        self.columns = [c for c in self.columns if c.par not in set(names)]
-        table = self.query_one("#chans", DataTable)
+        mod.columns = [c for c in mod.columns if c.par not in set(names)]
         for name in names:
-            self.board.pop(name, None)      # a stale value would read as live
-            try:
-                table.remove_column(name)
-            except Exception:
-                pass        # a board parameter, which has no column
-        self.fit_columns()     # the width it held is now free
+            mod.board.pop(name, None)       # a stale value would read as live
+        if mod is self.active:
+            table = self.query_one("#chans", DataTable)
+            for name in names:
+                try:
+                    table.remove_column(name)
+                except Exception:
+                    pass    # a board parameter, which has no column
+            self.fit_columns()      # the width it held is now free
         self.log_line(f"[yellow]{', '.join(names)}: unknown to this module — "
-                      f"no longer polled[/yellow]")
+                      f"no longer polled[/yellow]", mod)
 
-    def on_command_result(self, label: str, error: str | None) -> None:
+    def on_command_result(self, mod: Module, label: str,
+                          error: str | None) -> None:
         if error:
-            self.log_line(f"[red]✗ {label}: {error}[/red]")
-            self.notify(error, title=label, severity="error", timeout=6)
+            self.log_line(f"[red]✗ {label}: {error}[/red]", mod)
+            # A write that failed on a tab nobody is looking at needs to say
+            # which module refused it -- the label alone names a channel.
+            title = (label if mod is self.active
+                     else f"{escape(mod.name)}: {label}")
+            self.notify(error, title=title, severity="error", timeout=6)
         else:
-            self.log_line(f"[green]✓[/green] {label}")
+            self.log_line(f"[green]✓[/green] {label}", mod)
 
     # -- rendering ---------------------------------------------------------
 
@@ -1514,19 +1933,29 @@ class HVApp(App):
         """
         return {c: n for c, n in self.labels.items() if 0 <= c < self.nch}
 
-    def _build_table(self) -> None:
-        """(Re)build the channel table for the module now connected.
+    def _build_table(self, cursor: Coordinate | None = None) -> None:
+        """(Re)build the channel table for the module now on screen.
 
         Called again when the Name column appears or goes, because Textual can
         only append columns and a name added at the right-hand edge would sit
-        nowhere near the channel it belongs to.  The cursor is put back on the
-        column it was on rather than the index it was at, so a rebuild does not
-        move it sideways under the operator's hand.
+        nowhere near the channel it belongs to -- and on every tab switch,
+        since a different module has different columns.  The cursor is put back
+        on the column it was on rather than the index it was at, so a rebuild
+        does not move it sideways under the operator's hand.  `cursor` is where
+        the arriving module left it; without one, wherever the table is now.
         """
         table = self.query_one("#chans", DataTable)
-        cursor = table.cursor_coordinate
         was = [k.value for k in table.columns]
-        held = was[cursor.column] if 0 <= cursor.column < len(was) else None
+        if cursor is None:
+            cursor = table.cursor_coordinate
+            held = was[cursor.column] if 0 <= cursor.column < len(was) else None
+        else:
+            # Arriving from another tab, so the column keys on screen belong to
+            # the module leaving.  Take the key from the one arriving.
+            keys = ["CH"] + ([NAME_COL] if self.named else []) + \
+                   [c.par for c in self.columns]
+            held = (keys[cursor.column] if 0 <= cursor.column < len(keys)
+                    else None)
 
         table.clear(columns=True)
         # One wider than the channel number needs, for the selection mark.
@@ -1539,7 +1968,6 @@ class HVApp(App):
                              width=col.width, key=col.par)
         for c in range(self.nch):
             table.add_row(*self._row_cells(c), key=f"ch{c}")
-        self._rows_built = True
         self.fit_columns()
 
         now = [k.value for k in table.columns]
@@ -1567,16 +1995,15 @@ class HVApp(App):
         return Text(self.labels.get(ch, ""))
 
     def _paint(self, sample: Sample) -> None:
+        """Render the active module's latest reading.  `on_sample` has already
+        stored it -- every module's readings are kept, painted or not."""
         table = self.query_one("#chans", DataTable)
         for c, row in enumerate(sample.channels):
             if c >= self.nch:
                 break
-            _, flags = decode_status(row.get("STATUS", "0"))
-            self.flags[c] = flags
-            self.values[c] = row
             for col in self.columns:
                 table.update_cell(f"ch{c}", col.par,
-                                  self._cell(col, row, flags))
+                                  self._cell(col, row, self.flags[c]))
 
     def fit_columns(self) -> None:
         """Hand the width the table is not using to the STRETCH column.
@@ -1698,6 +2125,8 @@ class HVApp(App):
         return out
 
     def _paint_board(self, stamp: float) -> None:
+        if self.active is None:
+            return
         b = self.board
         remote = b.get("BDCTR", "").upper() == "REMOTE"
         ilk = b.get("BDILK", "").upper()
@@ -1731,9 +2160,21 @@ class HVApp(App):
             line.append("  READ-ONLY", "bold cyan")
         self.query_one("#board", Static).update(line)
 
-    def log_line(self, markup: str) -> None:
+    def log_line(self, markup: str, mod: "Module | None" = None) -> None:
+        """One line of the session's record.
+
+        With more than one module open every line says which one it came from:
+        the log outlives the tab that was in front at the time, and "CH3 OFF"
+        with no supply named is not a record of anything.  Module names come
+        from profile names, which are not checked for console markup, so they
+        are escaped here.
+        """
         stamp = time.strftime("%H:%M:%S")
-        self.query_one("#log", RichLog).write(f"[dim]{stamp}[/dim] {markup}")
+        where = ""
+        if mod is not None and len(self.modules) > 1:
+            where = f"[dim]{escape(mod.name)}[/dim] "
+        self.query_one("#log", RichLog).write(
+            f"[dim]{stamp}[/dim] {where}{markup}")
 
     # -- helpers -----------------------------------------------------------
 
@@ -1792,10 +2233,11 @@ class HVApp(App):
         return True
 
     def submit(self, label: str, fn) -> None:
-        if self.worker is None:
+        mod = self.active
+        if mod is None or mod.worker is None:
             return
-        self.log_line(f"[dim]→ {label}[/dim]")
-        self.worker.submit(label, fn)
+        self.log_line(f"[dim]→ {label}[/dim]", mod)
+        mod.worker.submit(label, fn)
 
     # -- actions -----------------------------------------------------------
 
@@ -1917,7 +2359,7 @@ class HVApp(App):
         why = self._save_labels()
         what = f"named {name}" if name else "name cleared"
         note = f"  [dim]({escape(why)})[/dim]" if why else ""
-        self.log_line(f"[cyan]CH{ch} {what}[/cyan]{note}")
+        self.log_line(f"[cyan]CH{ch} {what}[/cyan]{note}", self.active)
 
     def _save_labels(self) -> str:
         """Write the names to the profile.  Returns why not, if not.
@@ -1969,9 +2411,9 @@ class HVApp(App):
         in the same record as the writes themselves."""
         if self.selected:
             self.log_line(f"[cyan]selected {fmt_channels(self.selected)}"
-                          f"[/cyan]")
+                          f"[/cyan]", self.active)
         else:
-            self.log_line("[cyan]selection cleared[/cyan]")
+            self.log_line("[cyan]selection cleared[/cyan]", self.active)
 
     def action_toggle(self) -> None:
         if not self._rows_built:
@@ -2004,16 +2446,23 @@ class HVApp(App):
 
     @work
     async def action_all_off(self) -> None:
+        """Every live channel on the module in front of you -- not on the ones
+        in the other tabs.  `X` meant one supply before the panel could hold
+        several, and widening it silently would de-energise supplies that are
+        not on screen.  The prompt names the module for the same reason."""
         if not self._guard():
             return
-        live = [c for c in range(self.nch) if "ON" in self.flags[c]]
+        mod = self.active
+        live = mod.live
+        where = escape(mod.name)        # a dialog renders console markup
         if not live:
-            self.notify("no channels are on")
+            self.notify(f"no channels are on {where}")
             return
         ok = await self.push_screen_wait(ConfirmScreen(
-            f"Switch off all {len(live)} live channels?",
+            f"Switch off all {len(live)} live channels on {where}?",
             f"{', '.join(self.ch_label(c) for c in live)} will be commanded "
-            f"off.", danger=True, default_yes=True))
+            f"off.  Any other module stays as it is.",
+            danger=True, default_yes=True))
         if not ok:
             return
         for ch in live:
@@ -2037,17 +2486,22 @@ class HVApp(App):
         self.push_screen(HelpScreen(str(self.store.path), self.read_only))
 
     def action_refresh(self) -> None:
-        if self.worker:
-            self.log_line("[dim]refresh[/dim]")
-            self.worker.refresh_now()
+        mod = self.active
+        if mod and mod.worker:
+            self.log_line("[dim]refresh[/dim]", mod)
+            mod.worker.refresh_now()
 
     def action_pause(self) -> None:
-        if not self.worker:
+        """Pause the module on screen.  The others keep polling: pausing one
+        supply is not a reason to stop watching the rest."""
+        mod = self.active
+        if not mod or not mod.worker:
             return
-        self.worker.paused = not self.worker.paused
-        state = "paused" if self.worker.paused else "resumed"
-        self.log_line(f"[yellow]polling {state}[/yellow]")
+        mod.worker.paused = not mod.worker.paused
+        state = "paused" if mod.worker.paused else "resumed"
+        self.log_line(f"[yellow]polling {state}[/yellow]", mod)
         self._paint_board(time.time())
+        self._paint_tabs()
 
     def action_slower(self) -> None:
         self._set_interval(min(30.0, self.interval * 2))
@@ -2058,13 +2512,13 @@ class HVApp(App):
     def _set_interval(self, value: float) -> None:
         # `+` at 30s and `-` at 0.25s are no-ops; saying so beats a log line
         # that claims a change nobody made.
-        if value == self.interval:
+        mod = self.active
+        if mod is None or value == mod.interval:
             return
-        self.interval = value
-        self.log_line(f"[yellow]poll every {value:g}s[/yellow]")
-        if self.worker:
-            self.worker.interval = value
-            self.worker.refresh_now()
+        mod.interval = value
+        self.log_line(f"[yellow]poll every {value:g}s[/yellow]", mod)
+        if mod.worker:
+            mod.worker.refresh_now()
         self._paint_board(time.time())
 
 

@@ -84,9 +84,12 @@ leaving the panel.  The same list:
 | `X` | ALL OFF -- every channel on the module |
 | `c` | clear the board alarm and latched trips |
 | `r` | read everything now |
-| `p` | pause polling, or resume it |
+| `p` | pause polling on this module, or resume it |
 | `+` / `-` | poll slower / faster (0.25 s to 30 s) |
-| `m` | switch to another module |
+| `m` | connect another module -- it opens in a new tab |
+| `]` / `[` | next tab / previous tab |
+| `1`…`9` | go straight to that tab |
+| `w` | close this tab |
 | `?`, `F1` | this list, in the panel |
 | `q` | quit -- channels are left exactly as they are |
 
@@ -95,6 +98,37 @@ REMOTE/LOCAL state, the interlock, the alarm, the time of the last reading and
 the poll period.  The log along the bottom is the record the session leaves
 behind: every write, what it was aimed at, the poll rate, pauses, refreshes, the
 link itself and edits to the profile store.
+
+### Several modules at once
+
+`m` connects a module without disturbing the ones already connected; each gets a
+tab on the line under the title bar.  `]` and `[` walk them, `1`…`9` go straight
+to one, and clicking a tab works too.
+
+    1 Endcap rack ●   2 Barrel rack ○   3 Test bench !
+
+Every tab keeps polling, whether or not you are looking at it, so the marker
+beside each name stays true: `●` something is live, `○` every channel is off,
+`!` something worth looking at -- an alarm, a tripped channel, an asserted
+interlock or a link that has stopped answering -- `‖` its polling is paused, `…`
+nothing read back yet.  A tab is a glance, not a diagnosis; press the key and
+look.
+
+Everything else in the panel acts on the tab in front of you and no other.
+`X` switches off every live channel on **this** module and names it in the
+prompt; the other supplies are not touched.  The selection, the cursor, the poll
+rate and the channel names all belong to their own module, so coming back to a
+tab finds it as you left it.
+
+The log is shared, and once more than one module is connected every line says
+which one it came from -- the log outlives whichever tab was in front at the
+time.
+
+`w` closes a tab.  It is the only thing in the panel that disconnects anything,
+and it asks first if any channel is live: the module keeps its output after the
+panel stops watching it.  Connecting to a module that is already open goes to
+its tab instead of dialling it twice, which would double that module's traffic
+and give two tabs that disagree.
 
 ### Selecting channels
 
@@ -105,8 +139,8 @@ write to.  With nothing selected, an edit goes to the channel under the cursor,
 which is how the panel behaves before anything is selected.
 
 On, off and ALL OFF deliberately ignore the selection: `X` already switches
-everything off, and "off, but only these three" is not worth the ambiguity in
-front of a live supply.
+everything off on the module in front of you, and "off, but only these three" is
+not worth the ambiguity in front of a live supply.
 
 ### Adjusting by a step
 
@@ -216,9 +250,12 @@ will not parse is never silently overwritten -- it is moved to
 ## Safety
 
 - Every energise, de-energise, ALL OFF and trip-clear asks first.
-- Switching modules while any channel is live warns that the channels stay
-  energised after the link is dropped.
-- Quitting the panel switches nothing off.  Neither does closing the terminal.
+- ALL OFF reaches the module in front of you and names it in the prompt.  A
+  supply in another tab is never switched by a key aimed at this one.
+- Closing a tab while any channel on it is live warns that the channels stay
+  energised after the link is dropped.  Switching tabs disconnects nothing.
+- Quitting the panel switches nothing off, on any module.  Neither does closing
+  the terminal.
 - Nothing auto-connects.
 - `hvctl tui --read-only` disables `SET` entirely -- worth using for a panel
   that is only being watched.
