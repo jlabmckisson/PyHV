@@ -16,8 +16,10 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hvprofiles import Profile, ProfileStore                   # noqa: E402
-from hvtui import ConnectScreen, HVApp, ProfileEditScreen      # noqa: E402
+from hv import STATUS_BITS, STATUS_HELP                        # noqa: E402
+from hvprofiles import SIM_PROFILE, Profile, ProfileStore      # noqa: E402
+from hvtui import (HELP_SECTIONS, HELP_WIDTH, ConnectScreen,   # noqa: E402
+                   HVApp, HelpScreen, NameScreen, ProfileEditScreen)
 from textual.widgets import (DataTable, Input, Label,          # noqa: E402
                              RichLog, Static)
 
@@ -766,6 +768,279 @@ class AdjustingChannels(PanelTest):
             self.app.exit()
 
 
+class NamingChannels(PanelTest):
+    """A channel can be given a name, which is kept with the module's profile.
+
+    No 803x has a channel-name parameter, so nothing here goes on the wire:
+    the name is ours, and it follows the module rather than the supply.
+    """
+
+    async def connected(self, pilot):
+        worker = await super().connected(pilot)
+        self.app.query_one("#chans", DataTable).focus()
+        return worker
+
+    def column_keys(self) -> list[str]:
+        return [k.value for k in
+                self.app.query_one("#chans", DataTable).columns]
+
+    def cell(self, ch: int, key: str) -> str:
+        return self.app.query_one("#chans", DataTable).get_cell(
+            f"ch{ch}", key).plain
+
+    def saved_labels(self, profile: str = "Lab rack A") -> dict:
+        with open(self.path) as fh:
+            for p in json.load(fh)["profiles"]:
+                if p["name"] == profile:
+                    return p.get("labels", {})
+        return {}
+
+    async def name(self, pilot, text: str) -> None:
+        """Press n and fill the dialog in."""
+        await pilot.press("n")
+        await pilot.pause()
+        self.assertIsInstance(self.app.screen, NameScreen)
+        self.app.screen.query_one("#value", Input).value = text
+        await pilot.press("enter")
+        await pilot.pause()
+
+    async def test_the_column_appears_next_to_the_channel_number(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.assertNotIn("NAME", self.column_keys())
+            await self.name(pilot, "Endcap A")
+            self.assertEqual(self.column_keys()[:2], ["CH", "NAME"])
+            self.assertEqual(self.cell(0, "NAME"), "Endcap A")
+            self.assertEqual(self.cell(1, "NAME"), "")
+            self.assertEqual(self.app.labels, {0: "Endcap A"})
+            self.app.exit()
+
+    async def test_clearing_the_last_name_takes_the_column_away(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.name(pilot, "Endcap A")
+            await self.name(pilot, "")
+            self.assertNotIn("NAME", self.column_keys())
+            self.assertEqual(self.app.labels, {})
+            self.app.exit()
+
+    async def test_a_rebuild_leaves_the_cursor_on_the_same_column(self):
+        """The column it was on, not the index it was at -- otherwise the
+        first name of the session shifts every reading one place right."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("right")               # VSet, at index 1
+            table = self.app.query_one("#chans", DataTable)
+            self.assertEqual(table.cursor_column, 1)
+            await self.name(pilot, "Endcap A")
+            self.assertEqual(self.column_keys()[table.cursor_column], "VSET")
+            self.app.exit()
+
+    async def test_the_column_widens_to_the_longest_name(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.name(pilot, "Endcap A")
+            table = self.app.query_one("#chans", DataTable)
+            narrow = next(c for k, c in table.columns.items()
+                          if k.value == "NAME").width
+            await pilot.press("down")
+            await self.name(pilot, "Barrel ring 3 west")
+            wide = next(c for k, c in table.columns.items()
+                        if k.value == "NAME").width
+            self.assertEqual(wide, len("Barrel ring 3 west"))
+            self.assertGreater(wide, narrow)
+            self.app.exit()
+
+    async def test_enter_on_the_name_cell_opens_the_dialog(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.name(pilot, "Endcap A")
+            table = self.app.query_one("#chans", DataTable)
+            table.move_cursor(row=0, column=1)       # the Name column
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(self.app.screen, NameScreen)
+            self.assertEqual(self.app.screen.query_one("#value", Input).value,
+                             "Endcap A")
+            await pilot.press("escape")
+            await pilot.pause()
+            self.app.exit()
+
+    async def test_a_name_is_not_something_to_step(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.name(pilot, "Endcap A")
+            self.app.query_one("#chans", DataTable).move_cursor(row=0, column=1)
+            await pilot.press("d")
+            await pilot.pause()
+            self.assertEqual(len(self.app.screen.query("#step")), 0)
+            self.app.exit()
+
+    async def test_a_name_is_saved_to_the_profile(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            # The panel is on the simulator, which is never written to disk.
+            # Point it at a saved profile so what is under test is the path
+            # that persists names, not the link that happens to be up.
+            self.app.profile = self.app.store.get("Lab rack A")
+            await self.name(pilot, "Endcap A")
+            self.assertEqual(self.saved_labels(), {"0": "Endcap A"})
+            self.assertEqual(
+                self.app.store.get("Lab rack A").labels, {0: "Endcap A"})
+            self.app.exit()
+
+    async def test_a_name_survives_the_profile_being_edited(self):
+        """Editing the profile builds a new one from the form, which has no
+        name fields on it -- readdressing a module does not rewire it."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.app.profile = self.app.store.get("Lab rack A")
+            await self.name(pilot, "Endcap A")
+            await pilot.press("m")
+            await pilot.pause()
+            await pilot.press("y")                   # yes, the sim is live
+            await pilot.pause()
+            self.app.screen.query_one("#profiles", DataTable).move_cursor(row=0)
+            await pilot.press("e")
+            await pilot.pause()
+            self.app.screen.query_one("#f-addr", Input).value = "10.9.9.9"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(self.saved_labels(), {"0": "Endcap A"})
+            self.app.exit()
+
+    async def test_the_simulator_says_a_name_will_not_be_kept(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await self.name(pilot, "Endcap A")
+            self.assertEqual(self.cell(0, "NAME"), "Endcap A")
+            self.assertIn("not saved", self.log_text())
+            self.assertIn("simulator", self.log_text())
+            self.app.exit()
+
+    async def test_names_arrive_with_the_connection(self):
+        SIM_PROFILE.labels = {1: "Endcap A", 99: "a module this size has no 99"}
+        self.addCleanup(SIM_PROFILE.labels.clear)
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.assertIn("NAME", self.column_keys())
+            self.assertEqual(self.cell(1, "NAME"), "Endcap A")
+            # Kept, but not shown: a name past the end of the module belongs
+            # to a cable, and nobody unplugged it by mistyping an address.
+            self.assertIn(99, self.app.labels)
+            self.assertNotIn(99, self.app.named)
+            self.app.exit()
+
+    async def test_reconnecting_takes_the_new_modules_names(self):
+        """Another module's channels are not these, and neither are its
+        names: they come from the profile at connect, not from the session."""
+        SIM_PROFILE.labels = {1: "Endcap A"}
+        self.addCleanup(SIM_PROFILE.labels.clear)
+        async with self.app.run_test() as pilot:
+            worker = await self.connected(pilot)
+            self.assertEqual(self.app.labels, {1: "Endcap A"})
+            SIM_PROFILE.labels = {}
+            await pilot.press("m")
+            await pilot.pause()
+            await pilot.press("y")                   # yes, the sim is live
+            await pilot.pause()
+            self.app.screen.query_one("#profiles", DataTable).move_cursor(row=2)
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: self.app.worker is not worker
+                              and self.app._rows_built)
+            self.assertEqual(self.app.labels, {})
+            self.assertNotIn("NAME", self.column_keys())
+            self.app.exit()
+
+    async def test_a_name_is_refused_before_it_is_saved(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("n")
+            await pilot.pause()
+            self.app.screen.query_one("#value", Input).value = "Endcap [red]A"
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIn("[ or ]", self.error_text())
+            self.assertIsInstance(self.app.screen, NameScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(self.app.labels, {})
+            self.app.exit()
+
+
+class NamesInTheRecord(PanelTest):
+    """Once a channel has a name, everything that mentions it uses it.
+
+    A log read after the fact should say which detector was switched off, and
+    a dialog in front of a live supply should say what it is about to reach.
+    """
+
+    async def connected(self, pilot):
+        worker = await super().connected(pilot)
+        self.app.query_one("#chans", DataTable).focus()
+        self.app.labels = {1: "Endcap A"}
+        self.app._build_table()
+        return worker
+
+    async def test_naming_is_logged(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            self.app._set_label(2, "Barrel ring 3")
+            await pilot.pause()
+            self.assertIn("CH2 named Barrel ring 3", self.log_text())
+            self.app._set_label(2, "")
+            await pilot.pause()
+            self.assertIn("CH2 name cleared", self.log_text())
+            self.app.exit()
+
+    async def test_a_write_is_logged_against_the_name(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "right", "right", "enter")   # CH1 VSet
+            await pilot.pause()
+            self.assertIn("Endcap A", self.screen_text())
+            self.app.screen.query_one("#value", Input).value = "42.0"
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: self.app.values[1]
+                              .get("VSET", "").startswith("42"))
+            self.assertIn("CH1 Endcap A VSET = 42.0", self.log_text())
+            self.app.exit()
+
+    async def test_the_off_prompt_names_the_channel(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "f")           # CH1 is on in the sim
+            await pilot.pause()
+            self.assertIn("channel 1 (Endcap A)", self.screen_text())
+            await pilot.press("escape")
+            await pilot.pause()
+            self.app.exit()
+
+    async def test_all_off_names_the_channels_it_will_reach(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("X")
+            await pilot.pause()
+            self.assertIn("CH1 Endcap A", self.screen_text())
+            await pilot.press("escape")
+            await pilot.pause()
+            self.app.exit()
+
+    async def test_the_adjust_plan_names_every_row(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("down", "s", "down", "s")   # channels 1 and 2
+            await pilot.press("right", "right", "d")      # VSet
+            await pilot.pause()
+            self.app.screen.query_one("#step", Input).value = "50"
+            await pilot.pause()
+            self.assertIn("Endcap A", self.app.screen.query_one(
+                "#plan", Static).render().plain)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.app.exit()
+
+
 class TableWidth(PanelTest):
     """The status column takes whatever the terminal has spare."""
 
@@ -809,6 +1084,92 @@ class TableWidth(PanelTest):
             status, used, width = self.widths()
             self.assertEqual(used + status + 2, width)
             self.app.exit()
+
+
+class TheHelpScreen(PanelTest):
+    """`?` explains the panel without leaving it."""
+
+    async def test_question_mark_opens_it_from_the_picker(self):
+        """The panel opens on the picker, so help has to work from there."""
+        async with self.app.run_test() as pilot:
+            await pilot.pause()
+            self.assertIsInstance(self.app.screen, ConnectScreen)
+            await pilot.press("?")
+            await pilot.pause()
+            self.assertIsInstance(self.app.screen, HelpScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIsInstance(self.app.screen, ConnectScreen)
+            self.app.exit()
+
+    async def test_it_opens_over_the_panel_and_closes_again(self):
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            await pilot.press("?")
+            await pilot.pause()
+            self.assertIsInstance(self.app.screen, HelpScreen)
+            self.assertIn("Moving about", self.screen_text())
+            # The rest is below the fold, so it is checked in the text itself.
+            self.assertIn("Status flags", self.app.screen.body().plain)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIsInstance(self.app.screen, HelpScreen)
+            self.app.exit()
+
+    async def test_reading_the_help_is_not_an_action(self):
+        """The log records what was done to the supply.  Opening the help is
+        not that, and a session's record should not fill up with it."""
+        async with self.app.run_test() as pilot:
+            await self.connected(pilot)
+            before = self.log_text()
+            await pilot.press("?")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(self.log_text(), before)
+            self.app.exit()
+
+    async def test_read_only_mode_says_so(self):
+        async with self.app.run_test() as pilot:
+            self.app.read_only = True
+            await pilot.pause()
+            await pilot.press("?")
+            await pilot.pause()
+            self.assertIn("READ-ONLY", self.screen_text())
+            self.app.exit()
+
+
+class WhatTheHelpSays(unittest.TestCase):
+    """The text itself, checked without starting the app."""
+
+    def rendered(self) -> list[str]:
+        return HelpScreen("~/.config/hvctl/profiles.json").body().plain.split(
+            "\n")
+
+    def test_every_key_the_panel_answers_to_is_documented(self):
+        """A key that switches high voltage and is described nowhere is the
+        one that gets pressed by accident."""
+        described = {k for _, rows in HELP_SECTIONS for row in rows
+                     for k in row.keys}
+        for binding in HVApp.BINDINGS:
+            for key in binding.key.split(","):
+                with self.subTest(key=key):
+                    self.assertIn(key, described)
+
+    def test_every_status_flag_is_explained(self):
+        body = "\n".join(self.rendered())
+        for _, flag in STATUS_BITS:
+            with self.subTest(flag=flag):
+                self.assertIn(flag, body)
+                self.assertTrue(STATUS_HELP.get(flag))
+
+    def test_nothing_is_wider_than_the_dialog(self):
+        """Wrapped here rather than by the widget, so a line that runs over
+        would be re-wrapped flush left and lose its key column."""
+        for line in self.rendered():
+            if "profiles.json" in line:
+                continue        # one long word: it folds, or it does not
+            self.assertLessEqual(len(line), HELP_WIDTH, line)
 
 
 if __name__ == "__main__":

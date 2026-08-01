@@ -5,7 +5,9 @@ hvprofiles -- named connection profiles for hvctl.
 A profile is a name and an address -- an IP address or hostname for the
 Ethernet modules, a serial port for the USB ones.  The point is that neither
 the CLI nor the TUI should need one typed at it: you name each module once,
-and pick it from a list afterwards.
+and pick it from a list afterwards.  A profile also carries the names given
+to that module's channels: the 803x protocol has nowhere to keep them, and
+they belong to the installation rather than to the supply.
 
 Stored as JSON so it can be hand-edited, and written atomically so a crash
 mid-save cannot truncate the file.  Nothing here imports hv.py -- the CLI
@@ -18,12 +20,16 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_PORT = 1470
 DEFAULT_BAUD = 9600         # the 803x USB VCP setting: 9600 8N1
 SCHEMA = 1
+
+# Longest channel name kept.  It sits in a table column next to eleven others
+# on an 80-column terminal, so a name that runs on is a name nobody reads.
+MAX_LABEL = 20
 
 # Hostnames and IPv4 literals.  Deliberately permissive: the connect attempt
 # is the real test, and rejecting something resolvable would be worse than
@@ -56,6 +62,14 @@ class Profile:
     kind: str = "tcp"           # "tcp", "serial", or "sim" for the fake module
     device: str = ""            # serial only, e.g. /dev/ttyACM0
     baud: int = DEFAULT_BAUD    # serial only
+    # Channel number -> what is on the far end of that cable.  Kept here
+    # because the module has no parameter for it: a channel name describes the
+    # installation, not the supply, and a supply swapped out for a spare
+    # should arrive with the names of the strings it now feeds.
+    labels: dict[int, str] = field(default_factory=dict)
+
+    def label(self, ch: int) -> str:
+        return self.labels.get(ch, "")
 
     @property
     def is_sim(self) -> bool:
@@ -79,6 +93,10 @@ class Profile:
             d.update(device=self.device, baud=self.baud)
         else:
             d.update(host=self.host, port=self.port)
+        if self.labels:
+            # String keys, because JSON has no other kind, and in channel
+            # order so the file stays worth reading by hand.
+            d["labels"] = {str(c): n for c, n in sorted(self.labels.items())}
         return d
 
     @classmethod
@@ -88,7 +106,8 @@ class Profile:
                    port=int(d.get("port") or DEFAULT_PORT),
                    kind=str(d.get("kind") or "tcp"),
                    device=str(d.get("device", "")).strip(),
-                   baud=int(d.get("baud") or DEFAULT_BAUD))
+                   baud=int(d.get("baud") or DEFAULT_BAUD),
+                   labels=read_labels(d.get("labels")))
 
 
 # Always offered, never stored: the simulator needs no configuration and
@@ -113,6 +132,44 @@ def clean_name(text: str, taken: list[str] | tuple = ()) -> str:
         if name.casefold() == other.casefold():
             raise ValueError(f"a profile named {other!r} already exists")
     return name
+
+
+def clean_label(text: str) -> str:
+    """Normalise a channel name.  Empty is legal and means "no name".
+
+    Square brackets are refused rather than escaped.  A name is shown in the
+    panel's log and in its dialogs, both of which take console markup, and one
+    place that enforces the rule beats every display having to remember to
+    escape.  Nothing on the end of a cable needs a bracket in its name.
+    """
+    name = "".join(c for c in " ".join(text.split()) if c.isprintable())
+    if len(name) > MAX_LABEL:
+        raise ValueError(f"name is too long ({MAX_LABEL} characters max)")
+    if "[" in name or "]" in name:
+        raise ValueError("name cannot contain [ or ]")
+    return name
+
+
+def read_labels(raw) -> dict[int, str]:
+    """Channel names as stored, skipping anything that is not one.
+
+    Loading never raises, so a hand-edited file with a stray key costs that
+    one name rather than the whole profile.
+    """
+    out: dict[int, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        if not isinstance(value, str):
+            continue        # str(None) is "None", which is not a name
+        try:
+            ch = int(key)
+            name = clean_label(value)
+        except (TypeError, ValueError):
+            continue
+        if ch >= 0 and name:
+            out[ch] = name
+    return out
 
 
 def clean_device(text: str) -> str:

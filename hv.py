@@ -27,9 +27,10 @@ Examples:
     hvctl.py --host 192.168.0.250 status
     hvctl.py --host 192.168.0.250 monitor --interval 2
     hvctl.py --serial /dev/ttyACM0 get 3 VMON
+    hvctl.py --profile "Lab rack A" name 3 Endcap A
     hvctl.py --host 192.168.0.250 set 3 VSET 1500
     hvctl.py --host 192.168.0.250 on 3
-    hvctl.py --host 192.168.0.250 status --json | jq '.channels[].vmon'
+    hvctl.py --host 192.168.0.250 --json status | jq '.channels[].vmon'
     hvctl.py --host 192.168.0.250 raw '$CMD:MON,PAR:BDFREL'
 """
 
@@ -45,7 +46,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from hvprofiles import Profile, ProfileStore
+from hvprofiles import SIM_PROFILE, Profile, ProfileStore, clean_label
 
 CRLF = b"\r\n"
 DEFAULT_TCP_PORT = 1470
@@ -62,6 +63,29 @@ STATUS_BITS = [
 ALARM_FLAGS = {"OVC", "OVV", "UNV", "TRIP", "OVP", "TWN", "OVT",
                "KILL", "INTLK", "FAIL", "MAXV"}
 BUSY_FLAGS = {"RUP", "RDW"}
+
+# One line per flag, for the panel's help screen and the README.  Kept next to
+# the bit table so the two are read and edited together.  These are the
+# manual's mnemonics said in words -- the module is the authority on what
+# tripped it, and a flag is worth looking up before it is cleared.
+STATUS_HELP = {
+    "ON":    "output is on",
+    "RUP":   "ramping up towards VSet",
+    "RDW":   "ramping down",
+    "OVC":   "over current — IMon reached ISet",
+    "OVV":   "over voltage — VMon above VSet",
+    "UNV":   "under voltage — VMon below VSet",
+    "TRIP":  "tripped off after OVC lasted longer than Trip",
+    "OVP":   "over power",
+    "TWN":   "temperature warning",
+    "OVT":   "over temperature",
+    "KILL":  "switched off through the KILL input",
+    "INTLK": "off because the interlock is asserted",
+    "ISDIS": "output disabled",
+    "FAIL":  "internal failure",
+    "LOCK":  "front panel locked",
+    "MAXV":  "VSet above the module's voltage limit",
+}
 
 RESP_RE = re.compile(r"^#(?P<hdr>[A-Z]+):(?P<res>OK|ERR)(?:,VAL:(?P<val>.*))?$")
 
@@ -754,21 +778,31 @@ def num(raw: str, width: int = 9, prec: int = 2) -> str:
 STATUS_PARAMS = ["VSET", "VMON", "ISET", "IMON", "RUP", "RDW", "TRIP", "STATUS"]
 
 
-def render_status(dev: Device, pal: Palette) -> str:
+def render_status(dev: Device, pal: Palette, labels: dict | None = None) -> str:
     rows = dev.snapshot(STATUS_PARAMS)
     v_unit = dev.info_ch("VMON").unit or "V"
     i_unit = dev.info_ch("IMON").unit or "uA"
 
+    # The name column is only there for a module that has names: on a table
+    # this wide, a column of blanks is worth less than the space it costs.
+    labels = labels or {}
+    named = {c: labels.get(c, "") for c in range(len(rows))}
+    w = max((len(n) for n in named.values()), default=0)
+
     lines = []
-    hdr = (f"{'CH':>2}  {'VSet/'+v_unit:>9} {'VMon/'+v_unit:>9} "
+    name_hdr = f"{'Name':<{w}}  " if w else ""
+    hdr = (f"{'CH':>2}  {name_hdr}"
+           f"{'VSet/'+v_unit:>9} {'VMon/'+v_unit:>9} "
            f"{'ISet/'+i_unit:>9} {'IMon/'+i_unit:>9} "
            f"{'RUp':>5} {'RDwn':>5} {'Trip':>6}  Status")
     lines.append(pal.bold(hdr))
     lines.append(pal.dim("-" * len(hdr)))
     for c, r in enumerate(rows):
         _, flags = decode_status(r["STATUS"])
+        name = f"{named[c]:<{w}}  " if w else ""
         lines.append(
-            f"{c:>2}  {num(r['VSET'])} {num(r['VMON'])} "
+            f"{c:>2}  {name}"
+            f"{num(r['VSET'])} {num(r['VMON'])} "
             f"{num(r['ISET'])} {num(r['IMON'])} "
             f"{num(r['RUP'], 5, 0)} {num(r['RDW'], 5, 0)} "
             f"{num(r['TRIP'], 6, 1)}  {fmt_status(flags, pal)}"
@@ -776,13 +810,14 @@ def render_status(dev: Device, pal: Palette) -> str:
     return "\n".join(lines)
 
 
-def status_json(dev: Device) -> dict:
+def status_json(dev: Device, labels: dict | None = None) -> dict:
     rows = dev.snapshot(STATUS_PARAMS)
+    labels = labels or {}
     out = []
     for c, r in enumerate(rows):
         word, flags = decode_status(r["STATUS"])
-        entry = {"channel": c, "status_word": word, "flags": flags,
-                 "on": "ON" in flags}
+        entry = {"channel": c, "name": labels.get(c, ""),
+                 "status_word": word, "flags": flags, "on": "ON" in flags}
         for p in STATUS_PARAMS:
             if p == "STATUS":
                 continue
@@ -823,18 +858,31 @@ def cmd_info(dev, args, pal):
     return 0
 
 
+def channel_labels(args) -> dict:
+    """The channel names for the module being talked to, if it has a profile.
+
+    A --host or --serial link has none, and neither has the simulator: the
+    names live with the profile, so a connection made without one shows the
+    channels by number, as it always did.
+    """
+    prof = getattr(args, "profile_obj", None)
+    return dict(prof.labels) if prof is not None else {}
+
+
 def cmd_status(dev, args, pal):
+    labels = channel_labels(args)
     if args.json:
-        print(json.dumps(status_json(dev), indent=2))
+        print(json.dumps(status_json(dev, labels), indent=2))
     else:
-        print(render_status(dev, pal))
+        print(render_status(dev, pal, labels))
     return 0
 
 
 def cmd_monitor(dev, args, pal):
+    labels = channel_labels(args)
     try:
         while True:
-            body = render_status(dev, pal)
+            body = render_status(dev, pal, labels)
             stamp = time.strftime("%H:%M:%S")
             sys.stdout.write("\033[H\033[2J" if pal.on else "\n")
             print(pal.dim(f"{dev.t.describe()}   {stamp}   "
@@ -950,6 +998,64 @@ def cmd_profiles(dev, args, pal):
     return 0
 
 
+def cmd_name(dev, args, pal):
+    """Show or set the names of a module's channels.
+
+    Needs no connection: the names are ours, kept with the profile, because
+    the protocol has no channel-name parameter to keep them in.
+    """
+    store = args.store
+    prof = args.profile_obj
+    if prof is None:
+        if args.profile:
+            known = ", ".join(store.names()) or "none saved"
+            print(f"error: no profile named {args.profile!r} ({known})",
+                  file=sys.stderr)
+        else:
+            print("error: channel names are stored with a profile. Use "
+                  "--profile, or connect once from the panel so there is one "
+                  "to store them in.", file=sys.stderr)
+        return 2
+    if prof.is_sim:
+        print("error: the simulator has no saved profile to name channels in",
+              file=sys.stderr)
+        return 2
+    if not args.profile:
+        # Same fallback the read-only subcommands use, and said the same way:
+        # a name written to the wrong module is worse than a typo.
+        print(pal.dim(f"using profile {prof.name} ({prof.address})"),
+              file=sys.stderr)
+
+    if args.channel is None:
+        print(pal.dim(f"{prof.name} ({prof.address})"))
+        if not prof.labels:
+            print("  no channels named yet -- `hvctl name 0 \"Endcap A\"`")
+        for ch, name in sorted(prof.labels.items()):
+            print(f"  CH{ch:<3} {name}")
+        return 0
+
+    if args.channel < 0:
+        print("error: channel numbers start at 0", file=sys.stderr)
+        return 2
+    try:
+        name = clean_label(" ".join(args.name))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if name:
+        prof.labels[args.channel] = name
+    else:
+        prof.labels.pop(args.channel, None)
+    store.upsert(prof)
+    try:
+        store.save()
+    except OSError as e:
+        print(f"error: cannot write {store.path}: {e}", file=sys.stderr)
+        return 1
+    print(f"CH{args.channel} {'= ' + name if name else 'name cleared'}")
+    return 0
+
+
 def cmd_raw(dev, args, pal):
     for cmd in args.command:
         if not cmd.startswith("$"):
@@ -965,12 +1071,39 @@ def cmd_raw(dev, args, pal):
 # Entry point
 # --------------------------------------------------------------------------
 
+EPILOG = """\
+examples:
+  hvctl                              open the panel and pick a module
+  hvctl --sim tui                    the panel against the built-in simulator
+  hvctl --profile DUT status         one table of every channel
+  hvctl --profile DUT params         what this module says it has
+  hvctl --profile DUT name 3 Endcap A top
+  hvctl --profile DUT set 3 VSET 1500
+  hvctl -v --profile DUT get 3 VMON  -v echoes the wire traffic
+  hvctl --profile DUT --json status | jq '.channels[].vmon'
+                                     --json is a global flag: before the
+                                     subcommand, not after it
+
+`set`, `on`, `off` and edits in the panel change the state of the supply.  The
+module must be in REMOTE, or every one of them is refused.  Press ? in the
+panel for its keys; see README.md for the rest.
+
+environment:
+  HVCTL_HOST       default for --host
+  HVCTL_PROFILES   profile store (default ~/.config/hvctl/profiles.json)
+"""
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="hvctl",
-        description="Monitor and control CAEN 803x / SMART HV supplies. "
-                    "With no arguments, opens the TUI and asks which module "
-                    "to connect to.")
+        # Wrapped by hand: RawDescriptionHelpFormatter, which keeps the
+        # examples below lined up, prints this verbatim too.
+        description="Monitor and control CAEN 803x / SMART HV supplies.\n"
+                    "With no arguments, opens the TUI and asks which module\n"
+                    "to connect to.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     link = p.add_argument_group("connection")
     link.add_argument("--profile", metavar="NAME",
                       help="connect to a saved profile (see `hvctl profiles`)")
@@ -1029,6 +1162,12 @@ def build_parser():
     sub.add_parser("clear", help="clear the board alarm / latched trips")
     sub.add_parser("profiles", help="list saved connection profiles")
 
+    nm = sub.add_parser("name", help="name a channel (kept with the profile)")
+    nm.add_argument("channel", nargs="?", type=int,
+                    help="channel number; omit to list every name")
+    nm.add_argument("name", nargs="*",
+                    help="the name; omit it to clear the channel's name")
+
     r = sub.add_parser("raw", help="send literal protocol commands")
     r.add_argument("command", nargs="+")
 
@@ -1038,7 +1177,27 @@ def build_parser():
 HANDLERS = {"info": cmd_info, "status": cmd_status, "monitor": cmd_monitor,
             "get": cmd_get, "params": cmd_params, "raw": cmd_raw,
             "tui": cmd_tui, "set": cmd_set, "on": cmd_power, "off": cmd_power,
-            "clear": cmd_clear, "profiles": cmd_profiles}
+            "clear": cmd_clear, "profiles": cmd_profiles, "name": cmd_name}
+
+# Subcommands about the profile store rather than a module: they open no link.
+OFFLINE = ("profiles", "name")
+
+
+def named_profile(args) -> Profile | None:
+    """Which saved profile the connection flags point at, without connecting.
+
+    None when nothing points at one -- a bare --host, or no profiles at all.
+    Deliberately silent: `open_transport` is the one that reports and explains,
+    and this runs before it.
+    """
+    store = args.store
+    if args.profile:
+        return store.get(args.profile)
+    if args.sim:
+        return SIM_PROFILE
+    if args.serial or args.host:
+        return None
+    return store.get(store.last_used)
 
 
 def open_transport(args, pal):
@@ -1081,9 +1240,10 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     pal = Palette(sys.stdout.isatty() and not args.no_color and not args.json)
     args.store = ProfileStore()
+    args.profile_obj = named_profile(args)
 
-    if args.cmd == "profiles":
-        return cmd_profiles(None, args, pal)
+    if args.cmd in OFFLINE:
+        return HANDLERS[args.cmd](None, args, pal)
 
     try:
         transport, code = open_transport(args, pal)

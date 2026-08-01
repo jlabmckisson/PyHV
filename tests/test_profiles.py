@@ -18,9 +18,10 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import hv                                                   # noqa: E402
-from hvprofiles import (DEFAULT_BAUD, DEFAULT_PORT, Profile,  # noqa: E402
-                        ProfileStore, clean_baud, clean_device, clean_host,
-                        clean_name, clean_port, looks_like_device)
+from hvprofiles import (DEFAULT_BAUD, DEFAULT_PORT, MAX_LABEL,  # noqa: E402
+                        Profile, ProfileStore, clean_baud, clean_device,
+                        clean_host, clean_label, clean_name, clean_port,
+                        looks_like_device)
 
 
 class ProfileFile(unittest.TestCase):
@@ -94,6 +95,69 @@ class ProfileFile(unittest.TestCase):
         s.save()
         self.assertTrue(os.path.exists(self.path + ".bad"))
         self.assertEqual(self.on_disk()["profiles"][0]["name"], "New")
+
+
+class ChannelNames(unittest.TestCase):
+    """Names given to a module's channels, which live with its profile."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "profiles.json")
+        os.environ["HVCTL_PROFILES"] = self.path
+
+    def written(self) -> dict:
+        with open(self.path) as fh:
+            return json.load(fh)["profiles"][0]
+
+    def test_names_round_trip(self):
+        s = ProfileStore()
+        s.upsert(Profile("Lab rack A", "192.168.0.250",
+                         labels={0: "Endcap A", 3: "Barrel ring 3"}))
+        s.save()
+        back = ProfileStore().get("Lab rack A")
+        self.assertEqual(back.labels, {0: "Endcap A", 3: "Barrel ring 3"})
+        self.assertEqual(back.label(3), "Barrel ring 3")
+        self.assertEqual(back.label(1), "")
+
+    def test_a_module_with_no_names_writes_no_labels(self):
+        """The file is meant to be readable by hand: no empty scaffolding."""
+        s = ProfileStore()
+        s.upsert(Profile("Lab rack A", "192.168.0.250"))
+        s.save()
+        self.assertNotIn("labels", self.written())
+
+    def test_keys_are_channel_numbers_in_order(self):
+        s = ProfileStore()
+        s.upsert(Profile("Lab rack A", "192.168.0.250",
+                         labels={7: "last", 0: "first"}))
+        s.save()
+        self.assertEqual(list(self.written()["labels"]), ["0", "7"])
+
+    def test_a_hand_edited_mess_costs_only_that_name(self):
+        with open(self.path, "w") as fh:
+            json.dump({"schema": 1, "profiles": [
+                {"name": "Lab rack A", "host": "10.0.0.1",
+                 "labels": {"0": "Endcap A", "two": "nope", "3": None,
+                            "4": "x" * (MAX_LABEL + 1), "5": "br[a]cket"}}]}, fh)
+        s = ProfileStore()
+        self.assertEqual(s.load_error, "")
+        self.assertEqual(s.get("Lab rack A").labels, {0: "Endcap A"})
+
+    def test_whitespace_is_collapsed(self):
+        self.assertEqual(clean_label("  Endcap   A \n top "), "Endcap A top")
+
+    def test_a_blank_name_is_legal_and_means_none(self):
+        self.assertEqual(clean_label("   "), "")
+
+    def test_a_name_that_will_not_fit_is_refused(self):
+        with self.assertRaises(ValueError):
+            clean_label("x" * (MAX_LABEL + 1))
+
+    def test_markup_brackets_are_refused(self):
+        """The log and the dialogs take markup; one rule beats every display
+        having to remember to escape."""
+        with self.assertRaises(ValueError):
+            clean_label("Endcap [red]A")
 
 
 class FieldValidation(unittest.TestCase):
@@ -280,6 +344,81 @@ class CommandLineConnection(unittest.TestCase):
         code, _, err = self.run_cli(["status"])
         self.assertEqual(code, 2)
         self.assertIn("run `hvctl` with no arguments", err)
+
+
+class NamingFromTheCommandLine(CommandLineConnection):
+    """`hvctl name` edits the profile, so it opens no link to the module."""
+
+    def labels(self, profile="Lab rack A") -> dict:
+        return ProfileStore().get(profile).labels
+
+    def test_a_name_is_written_to_the_profile(self):
+        code, out, _ = self.run_cli(["--profile", "Lab rack A", "name", "0",
+                                     "Endcap", "A", "top"])
+        self.assertEqual(code, 0)
+        self.assertIn("CH0 = Endcap A top", out)
+        self.assertEqual(self.labels(), {0: "Endcap A top"})
+
+    def test_names_are_listed(self):
+        self.run_cli(["--profile", "Lab rack A", "name", "2", "Barrel"])
+        code, out, _ = self.run_cli(["--profile", "Lab rack A", "name"])
+        self.assertEqual(code, 0)
+        self.assertIn("CH2", out)
+        self.assertIn("Barrel", out)
+
+    def test_a_name_is_cleared_by_leaving_it_out(self):
+        self.run_cli(["--profile", "Lab rack A", "name", "2", "Barrel"])
+        code, out, _ = self.run_cli(["--profile", "Lab rack A", "name", "2"])
+        self.assertEqual(code, 0)
+        self.assertIn("name cleared", out)
+        self.assertEqual(self.labels(), {})
+
+    def test_it_does_not_connect(self):
+        """Test bench is 127.0.0.1:9, which refuses -- and is never dialled."""
+        code, _, err = self.run_cli(["name", "1", "Something"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.labels("Test bench"), {1: "Something"})
+        # Which module it fell back to, since a name on the wrong one is
+        # worse than a typo.
+        self.assertIn("using profile Test bench", err)
+
+    def test_an_unknown_profile_says_which_ones_there_are(self):
+        code, _, err = self.run_cli(["--profile", "nope", "name", "0", "X"])
+        self.assertEqual(code, 2)
+        self.assertIn("no profile named", err)
+        self.assertIn("Lab rack A", err)
+
+    def test_a_link_with_no_profile_has_nowhere_to_keep_names(self):
+        code, _, err = self.run_cli(["--host", "10.0.0.9", "name", "0", "X"])
+        self.assertEqual(code, 2)
+        self.assertIn("stored with a profile", err)
+
+    def test_the_simulator_has_nothing_to_write_to(self):
+        code, _, err = self.run_cli(["--sim", "name", "0", "X"])
+        self.assertEqual(code, 2)
+        self.assertIn("simulator", err)
+
+    def test_a_name_that_will_not_fit_is_refused(self):
+        code, _, err = self.run_cli(["--profile", "Lab rack A", "name", "0",
+                                     "x" * 40])
+        self.assertEqual(code, 2)
+        self.assertIn("too long", err)
+        self.assertEqual(self.labels(), {})
+
+    def test_names_reach_the_status_table(self):
+        self.run_cli(["--profile", "Lab rack A", "name", "1", "Endcap A"])
+        prof = ProfileStore().get("Lab rack A")
+        dev = hv.Device(hv.SimTransport())
+        body = hv.render_status(dev, hv.Palette(False), prof.labels)
+        self.assertIn("Name", body.splitlines()[0])
+        self.assertIn("Endcap A", body)
+        self.assertEqual(hv.status_json(dev, prof.labels)["channels"][1]["name"],
+                         "Endcap A")
+
+    def test_an_unnamed_module_gets_no_name_column(self):
+        body = hv.render_status(hv.Device(hv.SimTransport()),
+                                hv.Palette(False))
+        self.assertNotIn("Name", body.splitlines()[0])
 
 
 if __name__ == "__main__":

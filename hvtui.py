@@ -21,7 +21,9 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from rich.markup import escape
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -33,11 +35,13 @@ from textual.screen import ModalScreen
 from textual.widgets import (Button, DataTable, Footer, Header, Input, Label,
                              RichLog, Static)
 
-from hv import (ALARM_FLAGS, BUSY_FLAGS, PAR_ALIASES, Device, HVError,
-                ParamInfo, decode_status, device_for_profile)
-from hvprofiles import (DEFAULT_BAUD, DEFAULT_PORT, SIM_PROFILE, Profile,
-                        ProfileStore, clean_baud, clean_device, clean_host,
-                        clean_name, clean_port, looks_like_device)
+from hv import (ALARM_FLAGS, BUSY_FLAGS, PAR_ALIASES, STATUS_BITS,
+                STATUS_HELP, Device, HVError, ParamInfo, decode_status,
+                device_for_profile)
+from hvprofiles import (DEFAULT_BAUD, DEFAULT_PORT, MAX_LABEL, SIM_PROFILE,
+                        Profile, ProfileStore, clean_baud, clean_device,
+                        clean_host, clean_label, clean_name, clean_port,
+                        looks_like_device)
 
 
 # --------------------------------------------------------------------------
@@ -80,8 +84,11 @@ COLUMNS: list[Column] = [
 # which is the narrowest terminal the panel is meant for.
 STRETCH = "STATUS"
 
-# Column 0 of the table is the channel number, which is not a parameter.
-CH_COL = 1
+# The channel-name column.  Not a parameter -- no 803x has one -- so it is
+# never polled, and it is only in the table once some channel has a name: a
+# column of blanks is not worth the width on an 80-column terminal.  It sits
+# immediately right of the channel number, where the two read as one label.
+NAME_COL = "NAME"
 
 
 BOARD_STATIC = ["BDNAME", "BDSNUM", "BDFREL", "BDHVMAX", "BDHIMAX", "BDILKM"]
@@ -413,7 +420,8 @@ class EditScreen(ArrowFocus, ModalScreen[str | None]):
     ]
 
     def __init__(self, channels: list[int], col: Column, current: str,
-                 info: ParamInfo, mixed: bool = False):
+                 info: ParamInfo, mixed: bool = False,
+                 names: dict[int, str] | None = None):
         super().__init__()
         self.channels = channels
         self.col = col
@@ -421,6 +429,7 @@ class EditScreen(ArrowFocus, ModalScreen[str | None]):
         self.info = info
         self.mixed = mixed          # the targets do not all hold one value
         self.choices = info.choices
+        self.names = names or {}
 
     def compose(self) -> ComposeResult:
         n = len(self.channels)
@@ -428,6 +437,10 @@ class EditScreen(ArrowFocus, ModalScreen[str | None]):
             title = f"CH {fmt_channels(self.channels)}"
             if n > 1:
                 title += f"  ({n} channels)"
+            elif self.names.get(self.channels[0]):
+                # With one target there is room to say what it is, and this
+                # dialog is the last thing seen before the write goes out.
+                title += f"  {self.names[self.channels[0]]}"
             yield Label(f"{title}  •  {self.col.par}", id="dlg-title")
             hint = self.info.range_text() or "no descriptor from module"
             cur = "mixed" if self.mixed else (self.current or "--")
@@ -477,6 +490,68 @@ class EditScreen(ArrowFocus, ModalScreen[str | None]):
             self.query_one("#dlg-error", Label).update(Text(str(e), "bold red"))
 
 
+class NameScreen(ArrowFocus, ModalScreen["str | None"]):
+    """Give one channel a name, or take its name away.
+
+    Nothing is written to the module: no 803x has a channel-name parameter, so
+    the name is kept with the connection profile and follows the module.  A
+    blank field returns "" and clears it; cancelling returns None and changes
+    nothing.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss(None)", "Cancel", show=False),
+        Binding("left", "focus_previous", "", show=False),
+        Binding("right", "focus_next", "", show=False),
+    ]
+
+    def __init__(self, ch: int, current: str, saved_to: str = ""):
+        super().__init__()
+        self.ch = ch
+        self.current = current
+        self.saved_to = saved_to        # profile name, or "" when unsaveable
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"Name channel {self.ch}", id="dlg-title")
+            where = (f"Saved with the profile {self.saved_to}."
+                     if self.saved_to else
+                     "This link has no profile, so the name lasts only as "
+                     "long as this session.")
+            yield Label(f"What is on the far end of the cable.  {where}  "
+                        f"Blank removes the name.", id="dlg-detail")
+            # Stopped at the limit rather than refused at the end of typing:
+            # there is nothing to argue about, the column is only so wide.
+            yield Input(value=self.current, placeholder="e.g. Endcap A top",
+                        max_length=MAX_LABEL, id="value")
+            yield Label("", id="dlg-error")
+            with Horizontal(id="dlg-buttons"):
+                yield Button("Save", variant="primary", id="save")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        field = self.query_one("#value", Input)
+        field.focus()
+        field.action_end()
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    @on(Input.Submitted)
+    def _submitted(self) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        try:
+            self.dismiss(clean_label(self.query_one("#value", Input).value))
+        except ValueError as e:
+            self.query_one("#dlg-error", Label).update(Text(str(e), "bold red"))
+
+
 class AdjustScreen(ArrowFocus, ModalScreen["dict[int, str] | None"]):
     """Shift one numeric parameter of every target channel by a step.
 
@@ -496,12 +571,14 @@ class AdjustScreen(ArrowFocus, ModalScreen["dict[int, str] | None"]):
     ]
 
     def __init__(self, channels: list[int], col: Column, info: ParamInfo,
-                 currents: dict[int, str]):
+                 currents: dict[int, str],
+                 names: dict[int, str] | None = None):
         super().__init__()
         self.channels = channels
         self.col = col
         self.info = info
         self.currents = currents
+        self.names = names or {}
 
     def compose(self) -> ComposeResult:
         n = len(self.channels)
@@ -590,11 +667,17 @@ class AdjustScreen(ArrowFocus, ModalScreen["dict[int, str] | None"]):
             rows, err = self._plan()
         except ValueError as e:
             rows, err = [], str(e)
+        # The names of the targets, when they have any: a row of the plan says
+        # what is about to change, and "Endcap A" is what the operator knows.
+        width = max((len(self.names.get(c, "")) for c in self.channels),
+                    default=0)
         body = Text()
         for i, (ch, cur, new, problem) in enumerate(rows):
             if i:
                 body.append("\n")
             body.append(f"CH {ch:>2}  ")
+            if width:
+                body.append(f"{self.names.get(ch, ''):<{width}}  ", "dim")
             body.append(f"{cur:>10}", "dim")
             if new:
                 body.append("  →  ")
@@ -704,19 +787,23 @@ class ProfileEditScreen(ArrowFocus, ModalScreen["Profile | None"]):
         # Every other profile's name, so renaming to your own name is fine.
         taken = [p.name for p in self.store.profiles
                  if not (self.original and p.name == self.original.name)]
+        # The channel names are not on this form, and readdressing a module --
+        # or renaming it -- does not change what its channels are wired to.
+        labels = dict(self.original.labels) if self.original else {}
         try:
             if looks_like_device(text["f-addr"]):
                 device = clean_device(text["f-addr"])
                 baud = clean_baud(text["f-port"])
                 name = clean_name(text["f-name"], taken)
-                profile = Profile(name=name, kind="serial",
-                                  device=device, baud=baud)
+                profile = Profile(name=name, kind="serial", device=device,
+                                  baud=baud, labels=labels)
             else:
                 host, embedded = clean_host(text["f-addr"])
                 port = (embedded if embedded is not None
                         else clean_port(text["f-port"]))
                 name = clean_name(text["f-name"], taken)
-                profile = Profile(name=name, host=host, port=port)
+                profile = Profile(name=name, host=host, port=port,
+                                  labels=labels)
         except ValueError as e:
             self.query_one("#dlg-error", Label).update(Text(str(e), "bold red"))
             return
@@ -738,6 +825,9 @@ class ConnectScreen(ModalScreen["Profile | None"]):
         Binding("n", "new", "New"),
         Binding("e", "edit", "Edit"),
         Binding("d", "delete", "Delete"),
+        # The panel opens on this screen, so its help has to be reachable from
+        # here too -- a modal does not inherit the App's bindings.
+        Binding("question_mark,f1", "help", "Help", show=False),
         Binding("escape,q", "back", "Back", show=False),
     ]
 
@@ -791,9 +881,9 @@ class ConnectScreen(ModalScreen["Profile | None"]):
                 table.move_cursor(row=i)
                 break
         detail = (f"{len(self.store.profiles)} saved  •  "
-                  f"enter connects, n new, e edit, d delete")
+                  f"enter connects, n new, e edit, d delete, ? help")
         if not self.store.profiles:
-            detail = "No modules saved yet — press n to add one."
+            detail = "No modules saved yet — press n to add one, ? for help."
         self.query_one("#dlg-detail", Label).update(detail)
         if self.store.load_error:
             self._error(self.store.load_error)
@@ -838,6 +928,10 @@ class ConnectScreen(ModalScreen["Profile | None"]):
 
     def action_back(self) -> None:
         self.dismiss(None)
+
+    def action_help(self) -> None:
+        self.app.push_screen(HelpScreen(str(self.store.path),
+                                        getattr(self.app, "read_only", False)))
 
     @work
     async def action_new(self) -> None:
@@ -886,6 +980,224 @@ class ConnectScreen(ModalScreen["Profile | None"]):
 
 
 # --------------------------------------------------------------------------
+# Help
+# --------------------------------------------------------------------------
+
+# How Textual spells a key, and how a person does.  The help screen is read in
+# front of a live supply, so it shows `?` and `esc`, not `question_mark`.
+KEY_NAMES = {"question_mark": "?", "escape": "esc", "equals_sign": "=",
+             "plus": "+", "minus": "-", "up": "↑", "down": "↓", "left": "←",
+             "right": "→", "enter": "enter", "space": "space"}
+
+
+@dataclass(frozen=True)
+class HelpKey:
+    """One line of the key list.
+
+    `keys` holds the names Textual binds, not the pretty forms, so that a test
+    can check every binding the panel answers to is described here.  A key that
+    does something in front of a supply and is documented nowhere is the one
+    that gets pressed by accident.
+    """
+    keys: tuple[str, ...]
+    text: str
+
+    @property
+    def pretty(self) -> str:
+        return " ".join(KEY_NAMES.get(k, k) for k in self.keys)
+
+
+HELP_SECTIONS: list[tuple[str, list[HelpKey]]] = [
+    ("Moving about", [
+        HelpKey(("up", "down", "left", "right"),
+                "move the cursor.  The column it sits in is the parameter "
+                "that enter and d act on"),
+        HelpKey(("enter",),
+                "edit the cell under the cursor — one value, written to every "
+                "selected channel"),
+    ]),
+    ("Selection", [
+        HelpKey(("s",), "select the channel under the cursor, or drop it"),
+        HelpKey(("a",), "select every channel"),
+        HelpKey(("u", "escape"), "select none"),
+        HelpKey((), "With nothing selected an edit goes to the channel under "
+                    "the cursor.  On, off and ALL OFF ignore the selection "
+                    "entirely — X already switches everything off."),
+    ]),
+    ("Values", [
+        HelpKey(("enter",), "set one value on every target"),
+        HelpKey(("d",),
+                "adjust: shift every target by one step from wherever it "
+                "already sits.  The dialog lists each current → new pair, and "
+                "refuses the whole step if it would put any target outside "
+                "the module's range"),
+        HelpKey(("n",),
+                "name the channel.  Names are ours, not the module's: they "
+                "are kept with the profile and never sent"),
+    ]),
+    ("High voltage", [
+        HelpKey(("space",), "switch the channel under the cursor on or off"),
+        HelpKey(("o", "f"), "on, off — when a toggle is not what you want"),
+        HelpKey(("X",), "ALL OFF: every channel on the module"),
+        HelpKey(("c",), "clear the board alarm and latched trips"),
+        HelpKey((), "Every one of these asks first.  All of them need the "
+                    "module in REMOTE; in LOCAL the front panel has it and "
+                    "each SET comes back refused."),
+    ]),
+    ("Session", [
+        HelpKey(("r",), "read everything now, without waiting for the poll"),
+        HelpKey(("p",), "pause polling, or resume it"),
+        HelpKey(("plus", "equals_sign", "minus"),
+                "poll slower, faster.  The period doubles and halves between "
+                "0.25s and 30s; = is + without the shift"),
+        HelpKey(("m",), "switch to another module"),
+        HelpKey(("question_mark", "f1"), "this help"),
+        HelpKey(("q",),
+                "quit.  Channels are left exactly as they are — quitting the "
+                "panel does not switch anything off"),
+    ]),
+]
+
+HELP_WIDTH = 64
+
+HELP_READING = [
+    ("VMon, IMon", "green within regulation, yellow while ramping, red when "
+                   "a channel that is not ramping sits off its setpoint, dim "
+                   "when the output is off"),
+    ("VSet, ISet", "what the channel is asked for.  Editable"),
+    ("Name", "yours, from n.  Only in the table once some channel has one"),
+    ("Status", "the module's STATUS word, flag by flag"),
+]
+
+
+class HelpScreen(ModalScreen[None]):
+    """The panel's keys and what the table is showing, without leaving it.
+
+    Every key is here, including the ones the footer has no room for, and the
+    STATUS legend is coloured the way the table colours it -- the point of the
+    legend is to match what is on screen a line above it.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss(None)", "Close"),
+        Binding("q,question_mark,f1", "dismiss(None)", "Close", show=False),
+    ]
+
+    def __init__(self, store_path: str = "", read_only: bool = False):
+        super().__init__()
+        self.store_path = store_path
+        self.read_only = read_only
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="wide"):
+            yield Label("hvctl — keys and readings", id="dlg-title")
+            detail = "esc or ? closes  •  ↑ ↓ scrolls"
+            if self.read_only:
+                detail = "READ-ONLY: every SET is refused  •  " + detail
+            yield Label(detail, id="dlg-detail")
+            with VerticalScroll(id="help-body"):
+                # One Static, not one per section: the blank line between
+                # sections is then part of the text and stays one line.
+                yield Static(self.body())
+            with Horizontal(id="dlg-buttons"):
+                yield Button("Close", variant="primary", id="close")
+        # The panel's own footer lists the panel's keys, not this screen's.
+        yield Footer()
+
+    def body(self) -> Text:
+        out = Text()
+        for title, rows in HELP_SECTIONS:
+            out.append_text(self._section(title, rows))
+        out.append_text(self._reading())
+        out.append_text(self._flags())
+        out.append_text(self._notes())
+        return out
+
+    def on_mount(self) -> None:
+        self.query_one("#help-body", VerticalScroll).focus()
+
+    @on(Button.Pressed)
+    def _pressed(self) -> None:
+        self.dismiss(None)
+
+    # -- rendering ---------------------------------------------------------
+
+    @staticmethod
+    def _heading(title: str) -> Text:
+        return Text(title + "\n", "bold underline")
+
+    def _section(self, title: str, rows: list[HelpKey]) -> Text:
+        out = self._heading(title)
+        for row in rows:
+            if not row.keys:                # a note about the section above
+                out.append("  " + _wrap(row.text, 2) + "\n", "dim")
+                continue
+            out.append(f"  {row.pretty:<12}", "bold cyan")
+            out.append(_wrap(row.text, 14) + "\n")
+        out.append("\n")
+        return out
+
+    def _reading(self) -> Text:
+        out = self._heading("Reading the table")
+        for name, text in HELP_READING:
+            out.append(f"  {name:<12}", "bold")
+            out.append(_wrap(text, 14) + "\n")
+        out.append("\n")
+        return out
+
+    def _flags(self) -> Text:
+        out = self._heading("Status flags")
+        for _, flag in STATUS_BITS:
+            style = ("bold red" if flag in ALARM_FLAGS else
+                     "yellow" if flag in BUSY_FLAGS else
+                     "bold green" if flag == "ON" else "dim")
+            out.append(f"  {flag:<12}", style)
+            out.append(_wrap(STATUS_HELP.get(flag, ""), 14) + "\n")
+        out.append("\n")
+        return out
+
+    def _notes(self) -> Text:
+        out = self._heading("Where things are kept")
+        out.append("  Modules and channel names are saved in\n", "dim")
+        out.append(f"    {_tilde(self.store_path) or 'the profile store'}\n")
+        out.append("  " + _wrap(
+            "A module reached by --host or --sim has no profile, so names "
+            "given to it last only for this session.", 2) + "\n\n", "dim")
+        out.append("  " + _wrap(
+            "Not every module has every parameter.  A column the module "
+            "denies having is dropped from the table, and the log says which.",
+            2) + "\n", "dim")
+        return out
+
+
+def _tilde(path: str) -> str:
+    """`~/.config/hvctl/profiles.json` rather than the whole thing: the help
+    is 64 columns wide and a home directory is not news to the reader."""
+    home = str(Path.home())
+    return "~" + path[len(home):] if path.startswith(home + "/") else path
+
+
+def _wrap(text: str, indent: int, width: int = HELP_WIDTH) -> str:
+    """Wrap a description under a key column `indent` wide.
+
+    Wrapped here rather than by the widget: Rich would re-wrap the overflow
+    hard against the left margin, which loses the hanging indent that makes
+    the key column readable.  `width` is what fits `#help-body` inside a 76
+    column dialog once its border, padding and scrollbar are taken out.
+    """
+    room = max(20, width - indent)
+    lines, line = [], ""
+    for word in text.split():
+        if line and len(line) + 1 + len(word) > room:
+            lines.append(line)
+            line = word
+        else:
+            line = f"{line} {word}".strip()
+    lines.append(line)
+    return ("\n" + " " * indent).join(lines)
+
+
+# --------------------------------------------------------------------------
 # Application
 # --------------------------------------------------------------------------
 
@@ -906,8 +1218,8 @@ class HVApp(App):
         padding: 0 1;
         background: $surface;
     }
-    ConfirmScreen, EditScreen, AdjustScreen, ConnectScreen,
-    ProfileEditScreen {
+    ConfirmScreen, EditScreen, AdjustScreen, NameScreen, ConnectScreen,
+    ProfileEditScreen, HelpScreen {
         align: center middle;
     }
     #dialog {
@@ -937,6 +1249,10 @@ class HVApp(App):
     .flabel { width: 8; padding-top: 1; color: $text-muted; }
     .field Input { width: 1fr; }
     #profiles { height: auto; max-height: 12; border: solid $primary-darken-2; }
+    /* The help is longer than any terminal, so its dialog takes what height
+       there is and scrolls inside it rather than growing off the screen. */
+    HelpScreen #dialog { height: 90%; }
+    #help-body { height: 1fr; padding: 0 1; background: $panel; }
     /* Five buttons have to fit an 80-column terminal. */
     ConnectScreen #dlg-buttons Button { min-width: 10; margin-left: 1; }
     """
@@ -947,6 +1263,7 @@ class HVApp(App):
         Binding("f", "power(False)", "Off"),
         Binding("X", "all_off", "ALL OFF"),
         Binding("s", "select_toggle", "Select"),
+        Binding("n", "name_channel", "Name"),
         # Enter sets one value on every target; `d` shifts each target from
         # wherever it already is, which a single SET cannot express.
         Binding("d", "adjust", "Adjust ±"),
@@ -964,6 +1281,7 @@ class HVApp(App):
         Binding("m", "switch_module", "Module…"),
         Binding("plus,equals_sign", "slower", "Slower", show=False),
         Binding("minus", "faster", "Faster", show=False),
+        Binding("question_mark,f1", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -989,6 +1307,9 @@ class HVApp(App):
         # Channels an edit applies to.  Empty means "the one under the cursor",
         # which is how the panel behaved before there was a selection at all.
         self.selected: set[int] = set()
+        # Channel number -> name, loaded from the profile on connect.  Ours,
+        # not the module's: the protocol has nowhere to keep such a thing.
+        self.labels: dict[int, str] = {}
         self.worker: DeviceWorker | None = None
         self._rows_built = False
         self._last_error: str | None = None
@@ -1021,6 +1342,7 @@ class HVApp(App):
     def _attach(self, dev: Device, profile: Profile | None) -> None:
         self.dev = dev
         self.profile = profile
+        self.labels = dict(profile.labels) if profile else {}
         self.sub_title = (f"{profile.name} — {dev.t.describe()}" if profile
                           else dev.t.describe())
         self.log_line(f"[dim]link {dev.t.describe()}[/dim]")
@@ -1046,13 +1368,15 @@ class HVApp(App):
         self.info, self.board = {}, {}
         self.flags, self.values = [], []
         self.selected.clear()       # another module's channels are not these
+        self.labels = {}            # and neither are its names
         self._rows_built = False
         self._last_error = None
         if self.is_running:
             # Columns go too: the next module may not have the same ones.
             self.query_one("#chans", DataTable).clear(columns=True)
             self.query_one("#board", Static).update(
-                Text("not connected — press m to choose a module", "dim"))
+                Text("not connected — press m to choose a module, ? for help",
+                     "dim"))
 
     @work
     async def choose_module(self) -> None:
@@ -1099,8 +1423,9 @@ class HVApp(App):
             ok = await self.push_screen_wait(ConfirmScreen(
                 "Disconnect with channels live?" if live else
                 "Disconnect before the first reading?",
-                f"Channels {', '.join(map(str, live))} stay energised — the "
-                "module keeps its output when nothing is watching it." if live
+                f"{', '.join(self.ch_label(c) for c in live)} stay energised — "
+                "the module keeps its output when nothing is watching it."
+                if live
                 else "No channel has been read yet, so whether any output is "
                      "energised is not known here — and the module keeps its "
                      "output when nothing is watching it.",
@@ -1121,17 +1446,7 @@ class HVApp(App):
         self.flags = [[] for _ in range(nch)]
         self.values = [{} for _ in range(nch)]
         self.selected.clear()
-        table = self.query_one("#chans", DataTable)
-        table.clear(columns=True)
-        # One wider than the channel number needs, for the selection mark.
-        table.add_column(Text("CH", justify="right"), width=4, key="CH")
-        for col in columns:
-            table.add_column(Text(col.title, justify=col.align),
-                             width=col.width, key=col.par)
-        for c in range(nch):
-            table.add_row(self._ch_cell(c), *["" for _ in columns], key=f"ch{c}")
-        self._rows_built = True
-        self.fit_columns()
+        self._build_table()
         name = board.get("BDNAME", "?")
         self.log_line(f"[green]{name}[/green]  sn {board.get('BDSNUM', '?')}"
                       f"  fw {board.get('BDFREL', '?')}  {nch} channels")
@@ -1189,6 +1504,68 @@ class HVApp(App):
 
     # -- rendering ---------------------------------------------------------
 
+    @property
+    def named(self) -> dict[int, str]:
+        """The names that belong to channels this module actually has.
+
+        A profile keeps every name it was given.  Pointing it at a smaller
+        module hides the ones past the end rather than dropping them: the
+        cable was not unplugged because somebody mistyped an address.
+        """
+        return {c: n for c, n in self.labels.items() if 0 <= c < self.nch}
+
+    def _build_table(self) -> None:
+        """(Re)build the channel table for the module now connected.
+
+        Called again when the Name column appears or goes, because Textual can
+        only append columns and a name added at the right-hand edge would sit
+        nowhere near the channel it belongs to.  The cursor is put back on the
+        column it was on rather than the index it was at, so a rebuild does not
+        move it sideways under the operator's hand.
+        """
+        table = self.query_one("#chans", DataTable)
+        cursor = table.cursor_coordinate
+        was = [k.value for k in table.columns]
+        held = was[cursor.column] if 0 <= cursor.column < len(was) else None
+
+        table.clear(columns=True)
+        # One wider than the channel number needs, for the selection mark.
+        table.add_column(Text("CH", justify="right"), width=4, key="CH")
+        if self.named:
+            table.add_column(Text("Name"), width=self._name_width(),
+                             key=NAME_COL)
+        for col in self.columns:
+            table.add_column(Text(col.title, justify=col.align),
+                             width=col.width, key=col.par)
+        for c in range(self.nch):
+            table.add_row(*self._row_cells(c), key=f"ch{c}")
+        self._rows_built = True
+        self.fit_columns()
+
+        now = [k.value for k in table.columns]
+        if held in now:
+            table.move_cursor(row=min(cursor.row, max(self.nch - 1, 0)),
+                              column=now.index(held))
+
+    def _name_width(self) -> int:
+        """As wide as the longest name, and never wider than one can be."""
+        return min(MAX_LABEL,
+                   max([len("Name")] + [len(n) for n in self.named.values()]))
+
+    def _row_cells(self, c: int) -> list:
+        cells = [self._ch_cell(c)]
+        if self.named:
+            cells.append(self._name_cell(c))
+        row = self.values[c] if c < len(self.values) else {}
+        # Before the first reading there is nothing to render, and an empty
+        # STATUS would come out as OFF -- which is not what silence means.
+        cells += ([self._cell(col, row, self.flags[c]) for col in self.columns]
+                  if row else ["" for _ in self.columns])
+        return cells
+
+    def _name_cell(self, ch: int) -> Text:
+        return Text(self.labels.get(ch, ""))
+
     def _paint(self, sample: Sample) -> None:
         table = self.query_one("#chans", DataTable)
         for c, row in enumerate(sample.channels):
@@ -1227,6 +1604,23 @@ class HVApp(App):
         stretch.width = want
         table._require_update_dimensions = True
         table.refresh()
+
+    def _fit_names(self) -> None:
+        """Follow the longest name the Name column now holds.
+
+        Same trick as `fit_columns`: Textual has no public way to resize a
+        column after the fact, so the width goes on the Column record and the
+        table is told its dimensions are stale.
+        """
+        table = self.query_one("#chans", DataTable)
+        for key, column in table.columns.items():
+            if key.value == NAME_COL:
+                want = self._name_width()
+                if want != column.width:
+                    column.width = want
+                    table._require_update_dimensions = True
+                break
+        self.fit_columns()      # what it gained or gave up is STATUS's
 
     def _ch_cell(self, ch: int) -> Text:
         """The channel-number cell, carrying the selection mark.
@@ -1347,6 +1741,37 @@ class HVApp(App):
     def cursor_channel(self) -> int:
         return self.query_one("#chans", DataTable).cursor_row
 
+    def ch_label(self, ch: int) -> str:
+        """The channel as `CH3`, or `CH3 Endcap A` once it has been named.
+
+        Every mention of a channel outside the table goes through here or
+        `ch_phrase`.  The log is the only record a session in front of a live
+        supply leaves behind, and it should say which detector was switched
+        off -- not which row of a table nobody can see any more.
+        """
+        name = self.labels.get(ch, "")
+        return f"CH{ch} {name}" if name else f"CH{ch}"
+
+    def ch_phrase(self, ch: int) -> str:
+        """The same thing in prose: `channel 3 (Endcap A)`."""
+        name = self.labels.get(ch, "")
+        return f"channel {ch} ({name})" if name else f"channel {ch}"
+
+    def _column_key(self, index: int) -> str | None:
+        """The key of the table column at a position, or None if out of range.
+
+        Positions are looked up rather than counted from a constant: the Name
+        column comes and goes, and an off-by-one here would edit the wrong
+        parameter of a live supply.
+        """
+        keys = list(self.query_one("#chans", DataTable).columns)
+        return keys[index].value if 0 <= index < len(keys) else None
+
+    def _column_at(self, index: int) -> Column | None:
+        """The displayed parameter at a position -- None for CH and Name."""
+        key = self._column_key(index)
+        return next((c for c in self.columns if c.par == key), None)
+
     def _guard(self) -> bool:
         """True when writes are permitted right now."""
         if self.read_only:
@@ -1380,9 +1805,12 @@ class HVApp(App):
 
     @work
     async def edit_cell(self, coord: Coordinate) -> None:
-        if coord.column < CH_COL or coord.column - CH_COL >= len(self.columns):
+        if self._column_key(coord.column) == NAME_COL:
+            await self._name_channel(coord.row)     # a name is not a parameter
             return
-        col = self.columns[coord.column - CH_COL]
+        col = self._column_at(coord.column)
+        if col is None:
+            return
         if not col.editable:
             self.notify(f"{col.par} is read-only", severity="warning")
             return
@@ -1400,7 +1828,7 @@ class HVApp(App):
         mixed = len({self.values[c].get(col.par, "").upper()
                      for c in targets}) > 1
         value = await self.push_screen_wait(
-            EditScreen(targets, col, current, info, mixed))
+            EditScreen(targets, col, current, info, mixed, self.labels))
         if value is None:
             return
         self._write(col, {c: value for c in targets})
@@ -1416,10 +1844,13 @@ class HVApp(App):
         if not self._rows_built:
             return
         table = self.query_one("#chans", DataTable)
-        idx = table.cursor_column - CH_COL
-        if idx < 0 or idx >= len(self.columns):
+        if self._column_key(table.cursor_column) == NAME_COL:
+            self.notify("a name is not a number — press enter to set it",
+                        severity="warning")
             return
-        col = self.columns[idx]
+        col = self._column_at(table.cursor_column)
+        if col is None:
+            return
         info = self.info.get(col.par, ParamInfo(access=2))
         if not col.editable:
             self.notify(f"{col.par} is read-only", severity="warning")
@@ -1435,7 +1866,7 @@ class HVApp(App):
                    else [self.cursor_channel])
         plan = await self.push_screen_wait(AdjustScreen(
             targets, col, info, {c: self.values[c].get(col.par, "")
-                                 for c in targets}))
+                                 for c in targets}, self.labels))
         if plan:
             self._write(col, plan)
 
@@ -1444,8 +1875,69 @@ class HVApp(App):
         # Write with the module's own name for the parameter, not ours.
         wire = self.worker.wire_name(col.par) if self.worker else col.par
         for c, value in plan.items():
-            self.submit(f"CH{c} {col.par} = {value}",
+            self.submit(f"{self.ch_label(c)} {col.par} = {value}",
                         lambda d, c=c, v=value: d.set_ch(c, wire, v))
+
+    # -- naming ------------------------------------------------------------
+    # Not behind `_guard`: a channel name is ours, so it can be set in
+    # read-only mode and while the module is in LOCAL.
+
+    @work
+    async def action_name_channel(self) -> None:
+        if self._rows_built:
+            await self._name_channel(self.cursor_channel)
+
+    async def _name_channel(self, ch: int) -> None:
+        name = await self.push_screen_wait(NameScreen(
+            ch, self.labels.get(ch, ""), self._saveable()))
+        if name is not None:
+            self._set_label(ch, name)
+
+    def _saveable(self) -> str:
+        """The profile these names would be saved to, or "" if there is none."""
+        if self.profile is None or self.profile.is_sim:
+            return ""
+        return self.profile.name
+
+    def _set_label(self, ch: int, name: str) -> None:
+        if name == self.labels.get(ch, ""):
+            return
+        had_column = bool(self.named)
+        if name:
+            self.labels[ch] = name
+        else:
+            self.labels.pop(ch, None)
+        if bool(self.named) != had_column:
+            self._build_table()         # the column has just appeared or gone
+        elif self.named:
+            self.query_one("#chans", DataTable).update_cell(
+                f"ch{ch}", NAME_COL, self._name_cell(ch))
+            self._fit_names()
+
+        why = self._save_labels()
+        what = f"named {name}" if name else "name cleared"
+        note = f"  [dim]({escape(why)})[/dim]" if why else ""
+        self.log_line(f"[cyan]CH{ch} {what}[/cyan]{note}")
+
+    def _save_labels(self) -> str:
+        """Write the names to the profile.  Returns why not, if not.
+
+        The store's copy is the one written, not the object this panel
+        connected with: editing a profile while connected replaces it, and
+        saving the detached one would quietly lose the change.
+        """
+        if self.profile is None:
+            return "not saved: this link has no profile"
+        if self.profile.is_sim:
+            return "not saved: the simulator has no stored profile"
+        target = self.store.get(self.profile.name) or self.profile
+        target.labels = dict(self.labels)
+        self.profile.labels = dict(self.labels)
+        try:
+            self.store.save()
+        except OSError as e:
+            return f"not saved: cannot write {self.store.path}: {e}"
+        return ""
 
     # Selection is not a write, so it is not behind `_guard`: it stays usable
     # in read-only mode and while the module is in LOCAL.
@@ -1495,18 +1987,18 @@ class HVApp(App):
         vset = self.values[ch].get("VSET", "?")
         if turn_on:
             ok = await self.push_screen_wait(ConfirmScreen(
-                f"Energise channel {ch}?",
+                f"Energise {self.ch_phrase(ch)}?",
                 f"The channel will ramp to VSET = {vset} V.",
                 danger=True, default_yes=False))
         else:
             ok = await self.push_screen_wait(ConfirmScreen(
-                f"Switch channel {ch} off?",
+                f"Switch {self.ch_phrase(ch)} off?",
                 "The channel ramps down at RDWN (or drops immediately if "
                 "PDWN is KILL).",
                 danger=False, default_yes=True))
         if not ok:
             return
-        label = f"CH{ch} {'ON' if turn_on else 'OFF'}"
+        label = f"{self.ch_label(ch)} {'ON' if turn_on else 'OFF'}"
         self.submit(label, (lambda d: d.channel_on(ch)) if turn_on
                     else (lambda d: d.channel_off(ch)))
 
@@ -1520,12 +2012,13 @@ class HVApp(App):
             return
         ok = await self.push_screen_wait(ConfirmScreen(
             f"Switch off all {len(live)} live channels?",
-            f"Channels {', '.join(map(str, live))} will be commanded off.",
-            danger=True, default_yes=True))
+            f"{', '.join(self.ch_label(c) for c in live)} will be commanded "
+            f"off.", danger=True, default_yes=True))
         if not ok:
             return
         for ch in live:
-            self.submit(f"CH{ch} OFF", lambda d, c=ch: d.channel_off(c))
+            self.submit(f"{self.ch_label(ch)} OFF",
+                        lambda d, c=ch: d.channel_off(c))
 
     @work
     async def action_clear_alarm(self) -> None:
@@ -1538,6 +2031,10 @@ class HVApp(App):
             danger=False, default_yes=True))
         if ok:
             self.submit("BDCLR", lambda d: d.clear_alarm())
+
+    def action_help(self) -> None:
+        """Not logged: reading the help changes nothing about the supply."""
+        self.push_screen(HelpScreen(str(self.store.path), self.read_only))
 
     def action_refresh(self) -> None:
         if self.worker:
